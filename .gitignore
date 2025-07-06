@@ -1,0 +1,12 @@
+# Ignore all files in the faiss_indexes directory
+faiss_indexes/*
+logs/*
+vectordb_log_*
+.gradio
+.ipynb_checkpoints
+*.pyc
+__pycache__/
+*.pkl
+keys.py
+*.env
+*.log
