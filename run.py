@@ -350,7 +350,10 @@ def process_uploaded_files(files, use_type='retrieve'):
                     processed_list.append(result_str)
                     print(f"✅ Evaluation completed for {file.name}: {result_str}")
 
-                    accuracy_report_file = f"results/accuracy_report_{file.name.split('/')[-1]}"
+                    if global_generator_model.lower() == "openai mcq":
+                        accuracy_report_file = f"results/accuracy_report_{file.name.split('/')[-1]}"
+                    elif global_generator_model.lower() == "openai":
+                        accuracy_report_file = f"results/accuracy_report_{file.name.split('/')[-1].replace('.json', '_gen.json')}"
                     accuracy_reports = make_accuracy_reports(answer_objs, news_data, file_name=accuracy_report_file)
                     print("accuracy_reports")
                     for report in accuracy_reports[:5]:
