@@ -31,5 +31,28 @@
     utils.py (데이터처리 보조 등)
 ```
 
+### 사용방법
+ * http://165.132.192.52:7860에 접속
+ * 모델 타입 선택 (Local 또는 OpenAI)
+   * 기본키는 별도로 내장되어 있으며, 사용자 OpenAI 키 입력 후 Initialize Model 버튼 눌러서 키 연결 가능
+ * 특정한 질문에 대해 답변 확인 방법
+   * 우선 Please Enter your query 부분에 답변하고 싶은 질문 입력
+   * 그 다음에 number of results에서 Retriever가 가져올 답변 선택
+   * 마지막으로 date information에서 날짜 범위 지정. (시작일)/(끝일) - YYYYMMDD 형식으로
+   * Retrieve from query 버튼을 누르면 관련 질문에 대한 Retrieving 결과 가져옴
+   * Search 버튼을 누르면 관련 질문에 대한 답변 검색
+   * Retriever 타입 선택 가능 (추후 지원예정)
+* Answer - 답변 출력
+* Explanation of Search Resutls - 답변과 함께 근거가 되는 뉴스 검색결과 출력
+* Check Index Status - 날짜별 FAISS 인덱스 정보 검색
+* File Upload For Retrieval and Saving for FAISS
+    * QA 파일을 가져와서 드래그 하면 각 QA에 맞게 질문을 추출한 뒤 Retriever를 통해 답변 검색 결과 Document를 FAISS DB에 저장
+* QA Answer Retrieval - QA 파일을 가져와서 드래그 하면 QA에 대해 답변 수행.
+
+
+### 개선 중인 사항
+ * 다른 Retriever 사용이 가능하게 개선 (현재는 Google Custom Search + DPR만 사용가능)
+ * 로컬 모델에서 잘 돌아가는지 검증 중
+
 ### 저작자 현황
 utopiamath 
