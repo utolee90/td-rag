@@ -38,6 +38,7 @@ global_retriever = None
 global_generator_model = "OpenAI MCQ"  # 기본 생성기 모델
 global_retriever_model = "Facebook/rag-sequence-nq"  # 기본 검색자 모델
 global_tokenizer = None
+global_api_key = None  # OpenAI API 키를 위한 전역 변수
 
 import pickle
 from pydantic import BaseModel
@@ -68,6 +69,8 @@ from evaluate import accuracy, gen_eval
 
 # keys.py
 from keys import GCS_KEY, ENGINE_KEY, OPENAI_API_KEY, MODEL_PATH, MODEL_NAMES
+
+global_api_key = OPENAI_API_KEY  # OpenAI API 키 설정
 
 log_dir = Path("logs")
 log_dir.mkdir(exist_ok=True)
@@ -125,7 +128,7 @@ def initialize_manager():
 
 # FAISS DB에 넣기
 def process_uploaded_files(files, use_type='retrieve'):
-    global global_manager
+    global global_manager, global_api_key
     if global_manager is None:
         global_manager = initialize_manager()
 
@@ -294,7 +297,7 @@ def process_uploaded_files(files, use_type='retrieve'):
                     top_k = 5
                     # 전역 모델 사용
                     search_interface = SearchInterface(global_manager)
-                    search_interface.openai_api_key = OPENAI_API_KEY # OpenAI API 키 설정
+                    search_interface.openai_api_key = global_api_key # OpenAI API 키 설정
                     # 선택지 수정
                     choices = news.get('choices', [])
                     answer_index = news.get('answer', [])
@@ -328,15 +331,17 @@ def process_uploaded_files(files, use_type='retrieve'):
                     print(f"Evaluating {len(answer_objs)} answers against {len(news_data)} news data...")
                     print(answer_objs[:5])  # 디버깅용 출력
                     print(news_data[:5])  # 디버깅용 출력
-                    eval_results = accuracy(answer_objs, news_data) # 정확도 선다형
-                    # eval_results = gen_eval(answer_objs, news_data) # 정확도 선택형
+                    if global_generator_model.lower() == "openai mcq":
+                        eval_results = accuracy(answer_objs, news_data) # 정확도 선다형
+                    elif global_generator_model.lower() == "openai":
+                        eval_results = gen_eval(answer_objs, news_data) # 정확도 선택형
                     
                     # 결과를 문자열로 변환하여 저장
                     if isinstance(eval_results, dict):
                         # 딕셔너리인 경우 주요 정보만 추출
                         accuracy_score = eval_results.get('accuracy', 'N/A')
                         total_questions = eval_results.get('total', len(news_data))
-                        correct_answers = eval(accuracy_score) * int(total_questions) if isinstance(accuracy_score, str) else accuracy_score
+                        correct_answers = eval(accuracy_score) * int(total_questions) if isinstance(accuracy_score, str) else accuracy_score * int(total_questions)
                         # correct_answers = eval_results.get('correct', 'N/A')
                         result_str = f"File: {file.name} - Accuracy: {accuracy_score}, Correct: {correct_answers}/{total_questions}"
                     else:
@@ -344,6 +349,12 @@ def process_uploaded_files(files, use_type='retrieve'):
                     
                     processed_list.append(result_str)
                     print(f"✅ Evaluation completed for {file.name}: {result_str}")
+
+                    accuracy_report_file = f"results/accuracy_report_{file.name.split('/')[-1]}"
+                    accuracy_reports = make_accuracy_reports(answer_objs, news_data, file_name=accuracy_report_file)
+                    print("accuracy_reports")
+                    for report in accuracy_reports[:5]:
+                        print(report)
                     
                 except Exception as eval_error:
                     error_str = f"File: {file.name} - Evaluation Error: {str(eval_error)}"
@@ -375,8 +386,58 @@ def process_uploaded_files2(files):
     for result in process_uploaded_files(files, use_type='qa'):
         yield result
 
+def make_accuracy_reports(pred_data, gold_data, file_name="results/accuracy_report.jsonl"):
+    """pred_data의 정답 결과와 gold_data의 정답 결과를 비교하여 정확도 보고서를 생성하는 함수"""
+    assert len(pred_data) == len(gold_data), "Prediction and gold data must have the same length."
+    accuracy_results = []
+    obj_format = {
+        "question_id": "",
+        "type": "mcq", #mcq or generate
+        "prediction": [],
+        "answer": [],
+        "em": 0, # exact match or choice match(correct choice)
+        "f1": 0, # f1 score
+        "score": 0.0, # score
+    }
+    for pred, gold in zip(pred_data, gold_data):
+        from evaluate import exact_match_score, f1_score
+        import itertools
+        res_obj = obj_format.copy()
+        res_obj["question_id"] = pred.get("question_id", gold.get("question_id", "unknown"))
+        res_obj["prediction"] = pred.get("prediction", [])
+        res_obj["type"] = "mcq" if str(res_obj["prediction"][0]).isnumeric() else "generate" # 타입
+        res_obj["score"] = float(pred.get("score", 0.0))  # score 값 설정
+        if res_obj["type"] == "mcq":
+            res_obj["answer"] = gold.get("answer", [])
+            res_obj["em"] = int(res_obj["prediction"][0] in res_obj["answer"])
+        else:
+            answer_choices = gold.get("choices", [])
+            answer_num = gold.get("answer", [])
+            if not answer_choices or not answer_num:
+                res_obj["answer"] = []
+            else:
+                pred = pred.get("prediction", [""])
+                golds = [gold["choices"][int(idx)] for idx in gold["answer"]]
+                golds = [' '.join(perm) for perm in list(itertools.permutations(golds))]
+                res_obj["answer"] = [answer_choices[int(num)] for num in answer_num]
+                res_obj["em"] = exact_match_score(pred, golds[0])
+                res_obj["f1"] = f1_score(pred, golds[0])
+        accuracy_results.append(res_obj)
+    
+    accuracy_objs = [json.dumps(res, ensure_ascii=False) for res in accuracy_results]
+
+    with open(file_name, 'w', encoding='utf-8') as f:
+        f.write("\n".join(accuracy_objs))
+    
+    print(f"Accuracy report saved to {file_name}")
+    return accuracy_results
+
 def create_gradio_interface():
-    global global_manager
+    global global_manager, global_api_key
+    
+    # OpenAI API 키 초기화
+    global_api_key = OPENAI_API_KEY
+    
     global_manager = initialize_manager()
     search_interface = SearchInterface(global_manager)
     # 최대 길이 지정
@@ -556,12 +617,13 @@ def create_gradio_interface():
                     return search_interface.init_local_model_mcq(path, name)
                 elif model_type in ["OpenAI", "OpenAI MCQ"]:
                     # OpenAI API 키를 keys.py에서 가져옴
-                    result = search_interface.init_openai_model(OPENAI_API_KEY)
+                    result = search_interface.init_openai_model(api_key)
                     if model_type == "OpenAI MCQ":
                         return f"{result} (MCQ 모드 활성화)"
                     return result
                 else:
-                    return search_interface.init_openai_model(OPENAI_API_KEY)
+                    return search_interface.init_openai_model(api_key)
+                global_api_key = api_key  # OpenAI API 키 설정
             except Exception as e:
                 return f"An error occurred during loading: {str(e)}"
 
