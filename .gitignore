@@ -12,3 +12,4 @@ keys.py
 *.log
 results/*
 data/*
+heideltime/*
