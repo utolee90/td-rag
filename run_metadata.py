@@ -1,6 +1,6 @@
 import os
-os.environ["HF_HOME"] = "/mnt/nvme02/User/utopiamath/.cache/huggingface"
-os.environ["TRANSFORMERS_CACHE"] = "/mnt/nvme02/User/utopiamath/.cache/huggingface"
+os.environ["HF_HOME"] = "/mnt/nvme02/home/tdrag/.cache/huggingface"
+os.environ["TRANSFORMERS_CACHE"] = "/mnt/nvme02/home/tdrag/.cache/huggingface"
 
 from transformers.utils import move_cache
 move_cache()
@@ -130,7 +130,7 @@ def initialize_manager():
     return global_manager
 
 # FAISS DB에 넣기
-def process_uploaded_files(files, use_type='retrieve'):
+def process_uploaded_files(files, use_type='qa'):
     global global_manager, global_api_key
     if global_manager is None:
         global_manager = initialize_manager()
@@ -274,13 +274,46 @@ def process_uploaded_files(files, use_type='retrieve'):
                 for news_idx, news in enumerate(tqdm(news_data, desc="Processing news data")):
                     res_obj = dict()  # 각 뉴스에 대한 결과 객체 초기화
                     # print("news keys", news.keys())
-                    date = news.get('date', news.get('question_date', news.get('publish_date', '20000000')))
-                    if isinstance(date, str):
-                        date = process_date_string(date)
-                    elif isinstance(date, datetime.date):
-                        date = date.strftime("%Y%m%d")
+                    
+                    # question_ts 타임스탬프 처리
+                    if 'question_ts' in news:
+                        ts = news['question_ts']
+                        if isinstance(ts, (int, float)):
+                            # UNIX 타임스탬프인 경우 (초 또는 밀리초)
+                            if ts > 1e10:  # 밀리초 타임스탬프인 경우
+                                ts = ts / 1000
+                            date = datetime.datetime.fromtimestamp(ts).strftime("%Y%m%d")
+                        elif isinstance(ts, str):
+                            # 문자열 타임스탬프인 경우
+                            try:
+                                # ISO 형식 시도 (예: 2024-01-01T00:00:00Z)
+                                if 'T' in ts:
+                                    parsed_date = datetime.datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                                    date = parsed_date.strftime("%Y%m%d")
+                                # 숫자 문자열인 경우 (예: "1640995200")
+                                elif ts.isdigit():
+                                    timestamp = float(ts)
+                                    if timestamp > 1e10:  # 밀리초
+                                        timestamp = timestamp / 1000
+                                    date = datetime.datetime.fromtimestamp(timestamp).strftime("%Y%m%d")
+                                else:
+                                    # 다른 날짜 형식 시도
+                                    date = process_date_string(ts)
+                            except (ValueError, OSError) as e:
+                                print(f"Warning: Could not parse timestamp {ts}: {e}")
+                                date = process_date_string(str(ts))
+                        else:
+                            # 기타 형식
+                            date = str(ts)[:8] if len(str(ts)) >= 8 else '20000000'
                     else:
-                        date = '20000000'
+                        date = news.get('date', news.get('question_date', news.get('publish_date', '20000000')))
+                        if isinstance(date, str):
+                            date = process_date_string(date)
+                        elif isinstance(date, datetime.date):
+                            date = date.strftime("%Y%m%d")
+                        else:
+                            date = '20000000'
+                            
                     end_date = date
                     # start_date = None
                     start_date = compute_relative_date(end_date, -30)  # 최근 30일로 설정
@@ -386,13 +419,8 @@ def process_uploaded_files(files, use_type='retrieve'):
         progress_html += f"<p style='color: red;'>{error_msg}</p>"
         yield None, progress_html
 
-def process_uploaded_files2(files):
-    """QA 파일 업로드 처리 함수 (Generator 버전)"""
-    # generator 형태로 결과를 yield
-    for result in process_uploaded_files(files, use_type='qa'):
-        yield result
 
-def make_accuracy_reports(pred_data, gold_data, file_name="results/accuracy_report.jsonl"):
+def make_accuracy_reports(pred_data, gold_data, file_name="results/metadata_extraction.jsonl"):
     """pred_data의 정답 결과와 gold_data의 정답 결과를 비교하여 정확도 보고서를 생성하는 함수"""
     assert len(pred_data) == len(gold_data), "Prediction and gold data must have the same length."
     accuracy_results = []
@@ -438,6 +466,7 @@ def make_accuracy_reports(pred_data, gold_data, file_name="results/accuracy_repo
     print(f"Accuracy report saved to {file_name}")
     return accuracy_results
 
+# 인터페이스 생성
 def create_gradio_interface():
     global global_manager, global_api_key
     
@@ -449,8 +478,9 @@ def create_gradio_interface():
     # 최대 길이 지정
     max_length = 4000  # 최대 길이 설정 (토큰 수에 따라
 
-    with gr.Blocks(title="Search News Systems") as demo:
-        gr.Markdown("""## Search News Systems""")
+    # Gradio 인터페이스 설정
+    with gr.Blocks(title="Find Data from Query") as demo:
+        gr.Markdown("""## Find Data from Query""")
         
         # 시스템 상태 표시
         with gr.Row():
@@ -473,12 +503,14 @@ def create_gradio_interface():
         # 검색 섹션
         with gr.Row():
             with gr.Column():
+                # 쿼리 검색
                 query_input = gr.Textbox(
                     label="Please enter your query",
                     placeholder="Example : What is the cause of the fire in the mixed-use building on December 31, 2023?",
                     elem_classes=["submit-on-enter"],
                     autofocus=True
                 )
+                # top_k 슬라이더
                 top_k = gr.Slider(
                     minimum=1,
                     maximum=25,
@@ -486,32 +518,20 @@ def create_gradio_interface():
                     step=1,
                     label="number of results"
                 )
-                date_info = gr.Textbox(
-                    label="Date information",
-                    placeholder="Example : 20231230 / Recent 30 days / 2023-01-01,2023-01-31",
-                    lines=1
-                )
+                # 검색 버튼
                 with gr.Column():
                     search_button = gr.Button("Search", variant="primary")
 
+                # 경고 메시지 출력
                 warning_output = gr.HTML()
 
         gr.Examples(
             examples=[
-                ["What is the name of the president of South Korea?", 5, "20251231/20251231"],
-                 ["What is the name of the president of South Korea?", 5, "20220601/20241231"],
-                  ["What is the name of the president of South Korea?", 5, "20250501/20250630"]
+                ["What is the year of the current president of the United States election?"]
             ],
-            inputs=[query_input, top_k, date_info],
+            inputs=[query_input],
         )
-        # 답변 섹션
-        gr.Markdown("### Answer")
-        with gr.Row():
-            results_answer = gr.Textbox(
-                label="Search Result",
-                lines=2,
-                show_copy_button=True
-            )
+
         # 검색 결과 설명 섹션
         gr.Markdown("### Explanation of Search Results")
         with gr.Row():
@@ -540,33 +560,11 @@ def create_gradio_interface():
                 )
                 status_output = gr.HTML(label="Status Output")
         
-        # QA 답변 문제
-        gr.Markdown("### QA Answer Retrieval")
-        with gr.Row():
-            
-            with gr.Column():
-                file_output2 = gr.JSON(label="Current File Status")
-                upload_button2 = gr.File(
-                    label="Upload QA JSON/JSONL files",
-                    file_types=[".json", ".jsonl"],
-                    file_count="multiple",
-                )
-                status_output2 = gr.HTML(label="Status Output")
-
         # 모델 설정 탭
         def update_index_info():
             return global_manager.load_created_indexes()
         # Enter key submission handler
 
-
-        # 모델 변경 이벤트 연결
-        def toggle_model_settings(choice):
-            if choice in ["Local HuggingFace - Generate", "Local HuggingFace - MCQ"]:
-                return gr.Group(visible=True), gr.Group(visible=False)
-            elif choice in ["OpenAI", "OpenAI MCQ"]:
-                return gr.Group(visible=False), gr.Group(visible=True)
-            else:
-                return gr.Group(visible=False), gr.Group(visible=True)
 
         def init_model(api_key=None):
             global global_api_key
@@ -579,105 +577,136 @@ def create_gradio_interface():
                 return f"An error occurred during loading: {str(e)}"
 
         # 검색 2개 결과 출력 (성능 개선)
-        def double_search(model_type, query_input, top_k, date_info):
+        def return_date_info(query_input):
             import time
+            import subprocess
+            import os
+            import tempfile
+            import xml.etree.ElementTree as ET
+            from typing import List, Dict, Optional
             start_time = time.time()
+
+            # 결과 해석
+            results_output = "Results from query:\n"
+            results_output += f"Query: {query_input}\n\n"
+
+            # heidel_time 실행
+            heidel_time_dir = "/mnt/nvme02/home/tdrag/vaiv/RTRAG/heideltime"
+            jar_path = os.path.join(heidel_time_dir, "target/de.unihd.dbs.heideltime.standalone.jar")
+            lib_path = os.path.join(heidel_time_dir, "lib/*")
+            config_path = os.path.join(heidel_time_dir, "config.props")
+
+            # Create temporary input file
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp_input:
+                tmp_input.write(query_input)
+                tmp_input_path = tmp_input.name
             
-            # 답변만 추출
-            answer = search_interface.search_news(model_type, query_input, top_k, date_info, False)
-            # 검색결과 설명
-            search_results = search_interface.search_news(model_type, query_input, top_k, date_info, True)
-            # 저장 결과는 비우기
-            
+            try:
+                # Build command
+                cmd = [
+                    'java', '-cp', f"{jar_path}:{lib_path}",
+                    'de.unihd.dbs.heideltime.standalone.HeidelTimeStandalone',
+                    tmp_input_path,
+                    '-c', config_path,
+                    '-l', "english",
+                    '-t', "narratives",
+                    '-pos', "no"
+                ]
+
+                # execute HeidelTime
+                result = subprocess.run(
+                    cmd,
+                    cwd=heidel_time_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+
+                if result.returncode != 0:
+                    raise RuntimeError(f"HeidelTime failed: {result.stderr}")
+                
+                # Parse the output
+                timeml_output = result.stdout # xml output
+                root = ET.fromstring(timeml_output)
+                # timexes = []
+                timexes_bases = root.findall('.//TIMEX3')
+                
+                # 결과 해석 -> 텍스트 출력
+                results_output += "### HeidelTime Results\n\n"
+                for idx, val in enumerate(timexes_bases):
+                    results_output += f"Result {idx + 1}"
+                    results_output += f" - Type: {val.get('type', 'NONE')} "
+                    results_output += f" - Value: {val.get('value', 'NONE')} "
+                    results_output += f" - Text: {val.text.strip() if val.text else ''}"
+                    results_output += "\n"
+                
+            except subprocess.TimeoutExpired:
+                results_output += "\n### HeidelTime Error\n\nHeidelTime execution timed out\n"
+            except Exception as e:
+                results_output += f"\n### HeidelTime Error\n\nError: {str(e)}\n"
+            finally:
+                # Clean up temporary file
+                try:
+                    if os.path.exists(tmp_input_path):
+                        os.unlink(tmp_input_path)
+                except Exception:
+                    pass  # 파일 삭제 실패해도 계속 진행
+
+            # local llm 실행 - (일단 GPT-4o로 활용)
+            try:
+                from openai import OpenAI
+                client = OpenAI(api_key=global_api_key)
+                query_sample = "Today is July 13, 2025. I have a meeting tomorrow at 3 PM. Last week, I visited my grandmother."
+                results_xml_output = """<?xml version="1.0"?>
+<!DOCTYPE TimeML SYSTEM "TimeML.dtd">
+<TimeML>
+<TIMEX3 tid="t5" type="DATE" value="PRESENT_REF">Today</TIMEX3> is <TIMEX3 tid="t3" type="DATE" value="2025-07-13">July 13, 2025</TIMEX3>. I have a meeting <TIMEX3 tid="t6" type="DATE" value="2025-07-14">tomorrow</TIMEX3> at <TIMEX3 tid="t7" type="TIME" value="2025-07-14T15:00">3 PM.</TIMEX3> <TIMEX3 tid="t8" type="DATE" value="2025-W28">Last week</TIMEX3>, I visited my grandmother.
+
+</TimeML>"""
+                # 쿼리 추출 
+                root = ET.fromstring(results_xml_output)
+                timexes_bases = root.findall('.//TIMEX3')
+                results_from_sample = ""
+                for idx, val in enumerate(timexes_bases):
+                    results_from_sample += f"Result {idx + 1}"
+                    results_from_sample += f" - Type: {val.get('type', 'NONE')} "
+                    results_from_sample += f" - Value: {val.get('value', 'NONE')}"
+                    results_from_sample += f" - Text: {val.text.strip() if val.text else ''}"
+                    results_from_sample += "\n"
+                
+                response = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": f"Please deduce the results from the following query: {query_sample}"},
+                        {"role": "assistant", "content": f"Results: {results_from_sample}"},
+                        {"role": "user", "content": f"Please deduce the results from the following query: {query_input}"},
+                    ],
+                    max_tokens=1000,
+                    temperature=0.5
+                )
+
+                llm_results = response.choices[0].message.content.strip()
+                results_output += "\n### LLM Deduced Results\n\n"
+                results_output += llm_results + "\n"
+
+            except ET.ParseError as e:
+                results_output += f"\n### Error in XML Parsing\n\nError: {str(e)}\n"
+            except Exception as e:
+                results_output += f"\n### Error in LLM Processing\n\nError: {str(e)}\n"
+
             processing_time = time.time() - start_time
-            warning_output = f"<p style='color: green;'>✅ Process done - Used time: {processing_time:.2f} sec</p>"
             
-            # list 형식으로 출력
-            return answer, search_results, warning_output
+            # text 결과 출력
+            return results_output
 
         # 검색 버튼 클릭 이벤트 연결
         search_button.click(
-            fn=double_search,
-            inputs=[query_input, top_k, date_info],
-            outputs=[results_answer, results_output, warning_output],
+            fn=return_date_info,
+            inputs=[query_input],
+            outputs=[results_output],
             show_progress=True
         )
-
-        # 개별 쿼리 -> 검색자 추출 (최적화됨)
-        def run_retrieve(query_input, top_k=10, skip_printing=False, start_date=None, end_date=None):
-            import time
-            
-            from keys import GCS_KEY, ENGINE_KEY
-            
-            if not query_input.strip():
-                return "<p style='color: red;'>⚠️ Warning : no query input</p>"
-            
-            print("query_input", query_input)
-            start_time = time.time()
-            
-            # 전역 모델 사용 (매번 로드하지 않음)
-            global global_retriever, global_retriever_model, global_tokenizer
-            
-            if global_retriever is None or global_retriever_model is None or global_tokenizer is None:
-                print("Global models not loaded, loading now...")
-                device = 'cuda' if torch.cuda.is_available() else 'cpu'
-                global_retriever, global_retriever_model, global_tokenizer = load_model(
-                    BASE_RETRIEVER_MODEL, 
-                    top_k=top_k,
-                    device=device
-                )
-                print("Models loaded successfully")
-
-            retrieval_start = time.time()
-            search_result = retrieve_single_question(
-                query_input, global_retriever_model, global_retriever, global_tokenizer, GCS_KEY, ENGINE_KEY, 
-                top_k=top_k, start_date=start_date, end_date=end_date
-            )
-            retrieval_time = time.time() - retrieval_start
-            gcs_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y/%m/%d/%H:%M")
-
-            question_id = "userinput" + gcs_time.replace("/", "").replace(":", "")
-
-            output = {"question_id": question_id, "query": query_input, "search_time": gcs_time, "search_result": search_result}
-
-
-            if len(search_result) > 0:
-                
-                try: 
-                    #with open("retriever_output.json", "w") as f:
-                    #    json.dump(search_result, f, ensure_ascii=False, indent=4)
-                    # 인덱스 생성
-                    index_start = time.time()
-                    docs = create_documents(output, max_length=max_length)  # max_length 인자 추가
-                    # debugging
-                    print("docs", docs)
-                    # FAISS 인덱스 생성
-                    vector_store = create_faiss_index(
-                        docs, global_manager.embeddings, global_manager.base_dir, start_date=start_date, end_date=end_date
-                    )
-                    index_time = time.time() - index_start
-                    total_time = time.time() - start_time
-                    
-                    warning_output = f"<p style='color: green;'>✅ 처리 완료 - 검색: {retrieval_time:.2f}초, 인덱싱: {index_time:.2f}초, 총 시간: {total_time:.2f}초</p>"
-                except Exception as e:
-                    warning_output = f"Retrieving Error : <p style='color: red;'>⚠️ Warning: {str(e)}</p>"
-            else:
-                warning_output = "Searching Error <p style='color: red;'>⚠️ Warning: no search result</p>"
-            
-            # skip_printing -> 텍스트 출력 대신 vector_store 반환
-            if skip_printing:
-                return vector_store
-            else:
-                return warning_output
-        
-        def run_with_warning(query_input):
-            if not query_input.strip():
-                return "<p style='color: red;'>⚠️ Warning : no query input</p>"
-            return f"<p style='color: green;'>✅ Save data for '{query_input}'</p>"
-        
-        # 초기 경고 메시지 표시 함수
-        def show_initial_warning():
-            return "<p style='color: orange;'>⚠️ Warning: Retrieving process will start soon...</p>"
         
         # 모델 초기화 버튼 클릭 이벤트 연결
         init_model_btn.click(
@@ -685,7 +714,6 @@ def create_gradio_interface():
             inputs=[api_key],
             outputs=[model_status],
         )
-
 
         # 인덱스 검색 정보
         index_info_button.click(
@@ -701,70 +729,6 @@ def create_gradio_interface():
             show_progress=True
         )
 
-        # qa 파일 업로드 버튼 핸들러
-        upload_button2.change(
-            fn=process_uploaded_files2,
-            inputs=[upload_button2],  # 'qa'로 설정하여 QA 프로세스 사용
-            outputs=[file_output2, status_output2],
-            show_progress=True
-        )
-
-        def update_model_type(selected_model_type):
-            global global_generator_model, global_retriever_model, global_retriever, global_tokenizer
-
-            try:
-                device = 'cuda' if torch.cuda.is_available() else 'cpu'
-                global_generator_model = selected_model_type
-                global_retriever, global_retriever_model, global_tokenizer = load_model(
-                   'Facebook/rag-sequence-nq',
-                    top_k=25,  # 최대값으로 설정하여 재로드 방지
-                    device=device
-                )
-                
-                print(f"Model updated to: {selected_model_type}")
-                return f"Model successfully updated to: {selected_model_type}"
-            except Exception as e:
-                print(f"Error updating model: {e}")
-                return f"Error updating model: {e}"
-
-        # # Connect the model_type radio button to the update_model_type function
-        # model_type.change(
-        #     fn=update_model_type,
-        #     inputs=[model_type],
-        #     outputs=[model_status]
-        # )
-
-        def initialize_global_model(choice):
-            global global_retriever_model, global_retriever, global_tokenizer
-            try:
-                device = 'cuda' if torch.cuda.is_available() else 'cpu'
-                if choice == "Local HuggingFace - Generate":
-                    global_retriever, global_retriever_model, global_tokenizer = load_model(
-                        BASE_RETRIEVER_MODEL, 
-                        top_k=25,
-                        device=device
-                    )
-                    return "Local HuggingFace Generate model initialized."
-                elif choice == "Local HuggingFace - MCQ":
-                    global_retriever, global_retriever_model, global_tokenizer = load_model(
-                        BASE_RETRIEVER_MODEL, 
-                        top_k=25,
-                        device=device
-                    )
-                    return "Local HuggingFace MCQ model initialized."
-                elif choice in ["OpenAI", "OpenAI MCQ"]:
-                    global_retriever_model = None  # OpenAI 모델은 별도 초기화 필요
-                    return "OpenAI model selected. Please initialize with API key."
-                else:
-                    return "Invalid model type selected."
-            except Exception as e:
-                return f"Error initializing model: {str(e)}"
-
-        # model_type.change(
-        #     fn=initialize_global_model,
-        #     inputs=[model_type],
-        #     outputs=[model_status]
-        # )
     return demo
 
 def warmup_models():

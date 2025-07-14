@@ -279,4 +279,4 @@ dependencies:
       - yarl==1.17.1
       - zlib-state==0.1.9
       - zstandard==0.23.0
-prefix: /mnt/nvme02/User/utopiamath/anaconda3/envs/vaiv310
+prefix: /mnt/nvme02/home/tdrag/anaconda3/envs/vaiv310

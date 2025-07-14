@@ -551,3 +551,4 @@ def compute_relative_date(date1, n):
     new_date = d1 + timedelta(days=n)
     
     return new_date.strftime(date_format)  # YYYYMMDD 형식으로 반환
+

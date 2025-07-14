@@ -92,7 +92,7 @@ def load_model(model_name, top_k=10, device='cpu'):
     model_name = model_folder + model_name
 
     # 캐시 디렉토리를 명시적으로 설정
-    cache_dir = '/mnt/nvme02/User/utopiamath/.cache'
+    cache_dir = '/mnt/nvme02/home/tdrag/.cache'
 
     # 데이터셋 경로
     data_dir = os.path.join(cache_dir, "wiki_dpr/psgs_w100.nq.compressed/")
