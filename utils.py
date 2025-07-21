@@ -10,6 +10,7 @@ from uuid import uuid4
 from tqdm import tqdm
 import time
 import datetime
+import openai
 
 from retrieval.dpr import run_dpr_question, load_model
 from retrieval.gcs import search as gcs_search, parse_article
@@ -213,6 +214,13 @@ def create_faiss_index(documents, embeddings, base_dir="faiss_indexes", start_da
     """
     if not documents:
         raise ValueError("문서 리스트가 비어 있습니다.")
+    
+    if "_nm" in end_date or "_nm" in start_date:
+        use_metadata = False
+        end_date = end_date.replace('_nm', '') if end_date else None
+        start_date = start_date.replace('_nm', '') if start_date else None
+    else:
+        use_metadata = True
 
     # GPU 사용 가능 여부 확인
     import torch
@@ -240,7 +248,12 @@ def create_faiss_index(documents, embeddings, base_dir="faiss_indexes", start_da
             continue
         if end_date and compare_earlier_date(end_date, date_str):
             continue
-            
+        # date_str 지정
+        if not use_metadata:
+            date_str = f"{date_str}_nm"
+            start_date_nm = f"{start_date}_nm" if start_date else None
+            end_date_nm = f"{end_date}_nm" if end_date else None
+
         if date_str not in date_groups:
             date_groups[date_str] = []
         date_groups[date_str].append(document)
@@ -428,7 +441,36 @@ def process_date_string(date_string):
 
 # retrieve single question with DPR and GCS
 
-def retrieve_single_question(question, model, retriever, tokenizer, key, engine, top_k=10, start_date=None, end_date=None):
+NEWS_CATEGORY_LISTS = [
+    "Sociology",
+    "Politics",
+    "Economics",
+    "Culture",
+    "Science",
+    "Technology",
+    "Health",
+    "Sports",
+    "Entertainment",
+]
+
+# BERT Classifier를 사용하여 뉴스 카테고리 분류
+def classify_news_category(text, model, tokenizer):
+    """
+    주어진 텍스트를 BERT 모델을 사용하여 뉴스 카테고리로 분류합니다.
+    
+    :param text: 분류할 뉴스 텍스트
+    :param model: BERT 모델
+    :param tokenizer: BERT 토크나이저
+    :return: 분류된 뉴스 카테고리
+    """
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
+    outputs = model(**inputs)
+    logits = outputs.logits
+    predicted_class = logits.argmax(dim=1).item()
+    
+    return NEWS_CATEGORY_LISTS[predicted_class] if predicted_class < len(NEWS_CATEGORY_LISTS) else "Unknown"
+
+def retrieve_single_question(question, model, retriever, tokenizer, key, engine, top_k=10, start_date=None, end_date=None, use_metadata=True):
     """
     단일 질문에 대해 DPR과 GCS를 사용하여 검색 결과를 반환합니다.
     
@@ -440,13 +482,21 @@ def retrieve_single_question(question, model, retriever, tokenizer, key, engine,
     :param top_k: 검색 결과의 상위 K개를 반환
     :return: 검색 결과 리스트
     """
-    search_result = run_dpr_question(question, retriever, model, tokenizer)
+    # question이 string이 아닌 경우 별도 처리
+    if not isinstance(question, str):
+        new_question = question.get("query", "") # 
     
+    else:
+        new_question = question
+
+
+    search_result = run_dpr_question(new_question, retriever, model, tokenizer)
+
     if not search_result:
         return []
 
     # GCS로부터 추가 정보 가져오기
-    gcs_results = gcs_search(question, key, engine, top_k=top_k)
+    gcs_results = gcs_search(new_question, key, engine, top_k=top_k)
     gcs_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y/%m/%d/%H:%M")
     new_gcs_results = []
 
@@ -469,15 +519,24 @@ def retrieve_single_question(question, model, retriever, tokenizer, key, engine,
                     if len(chunk) > 4000:
                         chunk = chunk[:4000] + "..."
                     # 새로운 결과 추가
-                    new_gcs_results.append({
-                        "doc_id": article.get("doc_id", str(uuid4())),
-                        "text": chunk,
-                        "publish_date": article.get("publish_date", "2018/12/31"),
-                        "query": question,
-                        "url": article.get("url", ""),
-                        "title": article.get("title", ""),
-                        "search_time": gcs_time
-                    })
+                    if use_metadata:
+                        new_gcs_result_obj = {
+                            "doc_id": article.get("doc_id", str(uuid4())),
+                            "text": chunk,
+                            "publish_date": article.get("publish_date", "2018/12/31"),
+                            "query": question,
+                            "url": article.get("url", ""),
+                            "title": article.get("title", ""),
+                            "search_time": gcs_time,
+                            "authors": article.get("authors", []),
+                        }
+                    else:
+                        new_gcs_result_obj = {
+                            "doc_id": article.get("doc_id", str(uuid4())),
+                            "text": chunk,
+                        }
+
+                    new_gcs_results.append(new_gcs_result_obj)
 
         except Exception as e:
             print(f"URL 파싱 오류: {e}")
@@ -551,3 +610,161 @@ def compute_relative_date(date1, n):
     new_date = d1 + timedelta(days=n)
     
     return new_date.strftime(date_format)  # YYYYMMDD 형식으로 반환
+
+
+QA_NAME_ANALYZER = {
+    # formation of realtimeqa
+    "realtimeqa": {
+        "id": "question_id",
+        "query": "question_sentence",
+        "source": "question_source",
+        "date": "question_date",
+        "url": "question_url",
+        "answers": "" # 직접 입력하지 않고 처리
+    }
+}
+
+# qa_type 분석 함수
+# part_dic -> 기본 입력 -> 키 통일 id, query, source, date, url, answers
+# use type -> Retriever only, Retriever with Metadata
+def analyze_qa_type(part_dic, qa_name="realtimeqa", question_type="MCQ", use_type="Retriever Only"):
+    res_obj = {}
+    if qa_name == "realtimeqa":
+        rematch_keys = QA_NAME_ANALYZER[qa_name]
+        # 단순 키 변경
+        if use_type == "Retriever with Metadata":
+            for key, value in rematch_keys.items():
+                if value != "":
+                    res_obj[key] = part_dic.get(value, "")
+        else: # Retriever Only
+            res_obj["id"] = part_dic.get("question_id", "")
+            res_obj["query"] = part_dic.get("question_sentence", "")
+        
+        # 답변 변경
+        if question_type == "MCQ":
+            # 리스트 찾기
+            part_choices = part_dic.get("choices", []) # 선택지
+            res_obj["choices"] = part_choices
+            part_answer = part_dic.get("answer", [""])[0] # 첫 번째 답변
+            if isinstance(part_answer, list):
+                res_obj["answers"] = part_answer
+            else:
+                res_obj["answers"] = [part_answer] # 선택지 리스트
+        elif question_type == "Generate":
+            # 단일 답변 처리 - 
+            part_answer_num = int(part_dic.get("answer", [""])[0]) # 정수 변환
+            real_answer = part_dic.get("choices", [""])[part_answer_num] # 실제 답변
+            if isinstance(real_answer, list):
+                res_obj["answers"] = real_answer
+            else:
+                res_obj["answers"] = [real_answer]
+    
+    return res_obj
+
+
+def process_openai_generate(question: str, context: str, client=None, api_key=None) -> str:
+    """OpenAI Generate 모드: 자유 형태 답변 생성"""
+    try:
+        max_context = context
+
+        messages = [
+            {
+                "role": "system", 
+                "content": "You are a helpful assistant. Please provide a correct and simple answer based on the provided context. A pair of question and answer will be given to comprehend how to answer the question"
+            },
+            {
+                "role": "user", 
+                "content": "Context: For the third year in a row, Hong Kong received the dubious title of priciest city in the world, according to an analysis this week by global mobility company ECA International. The company calculates the list based on several factors, including the average price of groceries, rent, utilities, public transit and the strength of the local currency. \n\nQuestion: According to a recent ranking, which is the world’s most expensive city?\n\nPlease provide a correct and brief answer(a word or a phrase):"
+            },
+            {
+                "role": "assistant", 
+                "content": f"Hong Kong"
+            },
+            {
+                "role": "user", 
+                "content": f"Context: {max_context if max_context else 'No specific context provided'}\n\nQuestion: {question}\n\nPlease provide a brief answer:"
+            }
+        ]
+
+        # OpenAI 클라이언트 설정
+        if client is None and api_key is not None:
+            client = openai.OpenAI(api_key=api_key)
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",  # 더 나은 성능을 위해 gpt-4 사용
+            messages=messages,
+            temperature=0.4,
+            max_tokens=100,  # Generate 모드는 더 긴 답변 허용
+            top_p=0.9,
+            frequency_penalty=0,
+            presence_penalty=0
+        )
+
+        answer = response.choices[0].message.content.strip()
+        return answer
+
+    except Exception as e:
+        error_msg = f"OpenAI Generate API Error: {str(e)}"
+        print(f"[DEBUG] {error_msg}")
+        return error_msg
+
+def process_openai_mcq(question: str, context: str, choices=[], client=None, api_key=None) -> str:
+    """OpenAI MCQ 모드: 객관식 질문에 최적화된 답변"""
+    try:
+        max_context = context
+
+        # MCQ인지 확인하고 적절한 프롬프트 생성
+        if any(keyword in question.lower() for keyword in ["choices:", "a.", "b.", "c.", "d.", "0.", "1.", "2.", "3.", "4."]):
+            # 명확한 객관식 질문
+            system_prompt = "You are an expert at answering multiple choice questions. Analyze the context carefully and select the most accurate answer. Provide only the letter/number of the correct choice followed by a brief explanation."
+            user_prompt = f"Context: {max_context if max_context else 'No specific context provided'}\n\n{question}\n\nPlease select the correct answer and provide a brief explanation:"
+        else:
+            # 일반 질문을 MCQ 스타일로 처리
+            if type(choices) is str:
+                if ';' in choices: # ;로 구별
+                    choices_list = choices.split(';')
+                    choices_symbols = [re.match(r'([a-zA-Z0-9])\.?\b', s.strip()).group(1) for s in choices_list]
+                else:
+                    choices_symbols = re.findall(r'\b([a-zA-Z0-9]\.)\b', choices)
+                    choices_symbols = [s.replace('.', '') for s in choices_symbols]  # a. b. c. d. -> a b c d
+            elif type(choices) is list: # 리스트 -> 0, 1, 2, 3
+                choices_symbols = [str(i) for i in range(len(choices))]
+                if '0' not in choices[0]:
+                    choices = [f"{i}. {choice}" for i, choice in enumerate(choices)]  # a. b. c. d. 형식으로 변환
+                choices = '; '.join(choices)  # 리스트를 문자열로 변환
+
+            system_prompt = "You are an expert assistant. Based on the provided context, give a concise and precise answer. If it's a factual question, provide a specific answer number from choices Keep responses focused and to the point."
+            user_prompt = f"Context: {max_context if max_context else 'No specific context provided'}\n\nQuestion: {question}\n\nChoices: {choices}\n\nProvide a concise, precise answer among {', '.join(choices_symbols)}:"
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+        # OpenAI 클라이언트 설정
+        if client is None and api_key is not None:
+            client = openai.OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.1,  # MCQ는 더 일관된 답변을 위해 낮은 temperature
+            max_tokens=10,   # MCQ는 짧은 답변
+            top_p=0.8,
+            frequency_penalty=0,
+            presence_penalty=0
+        )
+
+        answer = response.choices[0].message.content.strip()
+        # 답변에서 번호 정보만 추출
+        match = re.search(r'\b([a-zA-Z0-9])\b', answer)
+        if match:
+            answer = match.group(1).strip()
+        else:
+            # 번호가 없으면 전체 답변 반환
+            print("[DEBUG] No specific choice found in the answer, returning full answer.")
+            return answer
+        return answer
+
+    except Exception as e:
+        error_msg = f"OpenAI MCQ API Error: {str(e)}"
+        print(f"[DEBUG] {error_msg}")
+        return error_msg

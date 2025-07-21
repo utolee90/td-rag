@@ -87,6 +87,8 @@ def gen_eval(preds, golds):
         golds = [gold["choices"][int(idx)] for idx in gold["answer"]]
         golds = [' '.join(perm) for perm in list(itertools.permutations(golds))]
         prediction = pred["prediction"]
+        golds = golds[0]
+        prediction = prediction[0]
         em_total += metric_max_over_ground_truths(exact_match_score, prediction, golds)
         f1_total += metric_max_over_ground_truths(f1_score, prediction, golds)
         #if score_exists:

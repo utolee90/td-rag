@@ -1,6 +1,6 @@
 import os
-os.environ["HF_DATASETS_CACHE"]="/mnt/nvme02/User/utopiamath/.cache"
-os.environ["TRANSFORMERS_CACHE"]="/mnt/nvme02/User/utopiamath/.cache"
+os.environ["HF_DATASETS_CACHE"]="/mnt/nvme02/home/tdrag/.cache"
+os.environ["TRANSFORMERS_CACHE"]="/mnt/nvme02/home/tdrag/.cache"
 
 # create_indexes.py
 import torch

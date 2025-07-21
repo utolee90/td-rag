@@ -338,7 +338,7 @@ class VectorStoreManager:
 
         return sorted(list(set(dates)))
 
-    def merge_date_range(self, start_date, end_date, output_name=None):
+    def merge_date_range(self, start_date, end_date, output_name=None, use_metadata=True):
         """날짜 범위의 인덱스들을 병합"""
         if output_name is None:
             output_name = f"merged_{start_date}_to_{end_date}"
@@ -347,7 +347,15 @@ class VectorStoreManager:
         date_range = self._date_range(start_date, end_date)
 
         for date in date_range:
-            index_path = self.base_dir / f"{date}"
+            # use_metadata에 따라 인덱스 경로 결정
+            if use_metadata:
+                index_path = self.base_dir / f"{date}"
+            else:
+                # 메타데이터가 없는 경우 _nm 접미사 확인
+                if not date.endswith("_nm"):
+                    date = f"{date}_nm"
+                index_path = self.base_dir / f"{date}"
+                
             if not index_path.exists() or not any(index_path.glob("*.faiss")): # faiss 파일이 없으면 건너뛰기
                 continue
             
@@ -415,12 +423,15 @@ class VectorStoreManager:
 
         return date_list
 
-    def search_with_date(self, query, k=5, date_info=None):
+    def search_with_date(self, query, k=5, date_info=None, use_metadata=True):
         """날짜 정보를 고려한 검색 실행"""
 
         # 날짜 없을 때 기본 날짜 범위는 최근 1개월
         if not date_info:
-            start_date, end_date =  "20181231", "20181231"
+            end_date = datetime.now().strftime("%Y%m%d")
+            start_date = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
+            print("No date_info provided, using default range:", start_date, end_date)
+            # start_date, end_date =  "20181231", "20181231"
         else:
             # 날짜가 있으면 텍스트 정보를 통해 날짜 추출
             dates_list = self.extract_dates_from_query(date_info)
@@ -457,8 +468,9 @@ class VectorStoreManager:
         # 날짜 범위에 해당하는 인덱스 병합
         merged_db = self.merge_date_range(
             start_date,
-            end_date
-
+            end_date,
+            use_metadata=use_metadata,
+            output_name=f"merged_{start_date}_to_{end_date}" if use_metadata else f"merged_{start_date}_to_{end_date}_nm"
         ) #      '''.strftime("%Y%m%d")'''
 
         if merged_db:

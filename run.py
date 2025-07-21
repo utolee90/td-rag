@@ -1,6 +1,6 @@
 import os
-os.environ["HF_HOME"] = "/mnt/nvme02/User/utopiamath/.cache/huggingface"
-os.environ["TRANSFORMERS_CACHE"] = "/mnt/nvme02/User/utopiamath/.cache/huggingface"
+os.environ["HF_HOME"] = "/mnt/nvme02/home/tdrag/.cache/huggingface"
+os.environ["TRANSFORMERS_CACHE"] = "/mnt/nvme02/home/tdrag/.cache/huggingface"
 
 from transformers.utils import move_cache
 move_cache()
@@ -22,7 +22,7 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 # os.environ["CUDA_VISIBLE_DEVICES"] = "6"
 
 # GPU 메모리 관리 설정
-if torch.cuda.is_available():
+if torch.cuda.is_available(): 
     torch.cuda.empty_cache()
     print(f"GPU 메모리: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB 사용 가능")
 
@@ -270,14 +270,45 @@ def process_uploaded_files(files, use_type='retrieve'):
                 res_text = ""
                 for news_idx, news in enumerate(tqdm(news_data, desc="Processing news data")):
                     res_obj = dict()  # 각 뉴스에 대한 결과 객체 초기화
-                    # print("news keys", news.keys())
-                    date = news.get('date', news.get('question_date', news.get('publish_date', '20000000')))
-                    if isinstance(date, str):
-                        date = process_date_string(date)
-                    elif isinstance(date, datetime.date):
-                        date = date.strftime("%Y%m%d")
+                    # question_ts 타임스탬프 처리
+                    if 'question_ts' in news:
+                        ts = news['question_ts']
+                        if isinstance(ts, (int, float)):
+                            # UNIX 타임스탬프인 경우 (초 또는 밀리초)
+                            if ts > 1e10:  # 밀리초 타임스탬프인 경우
+                                ts = ts / 1000
+                            date = datetime.datetime.fromtimestamp(ts).strftime("%Y%m%d")
+                        elif isinstance(ts, str):
+                            # 문자열 타임스탬프인 경우
+                            try:
+                                # ISO 형식 시도 (예: 2024-01-01T00:00:00Z)
+                                if 'T' in ts:
+                                    parsed_date = datetime.datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                                    date = parsed_date.strftime("%Y%m%d")
+                                # 숫자 문자열인 경우 (예: "1640995200")
+                                elif ts.isdigit():
+                                    timestamp = float(ts)
+                                    if timestamp > 1e10:  # 밀리초
+                                        timestamp = timestamp / 1000
+                                    date = datetime.datetime.fromtimestamp(timestamp).strftime("%Y%m%d")
+                                else:
+                                    # 다른 날짜 형식 시도
+                                    date = process_date_string(ts)
+                            except (ValueError, OSError) as e:
+                                print(f"Warning: Could not parse timestamp {ts}: {e}")
+                                date = process_date_string(str(ts))
+                        else:
+                            # 기타 형식
+                            date = str(ts)[:8] if len(str(ts)) >= 8 else '20000000'
                     else:
-                        date = '20000000'
+                        date = news.get('date', news.get('question_date', news.get('publish_date', '20000000')))
+                        if isinstance(date, str):
+                            date = process_date_string(date)
+                        elif isinstance(date, datetime.date):
+                            date = date.strftime("%Y%m%d")
+                        else:
+                            date = '20000000'
+
                     end_date = date
                     # start_date = None
                     start_date = compute_relative_date(end_date, -30)  # 최근 30일로 설정
