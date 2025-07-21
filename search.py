@@ -12,12 +12,25 @@ from keys import MODEL_PATH, MODEL_NAMES
 
 class SearchInterface:
     def __init__(self, vector_store_manager: VectorStoreManager):
-        from run import global_generator_model  # 지연 로드로 순환 참조 방지
+        try:
+            from run_metadata import global_generator_model  # 현재 파일에서 import
+        except ImportError:
+            try:
+                from run import global_generator_model  # 백업으로 run.py에서 import
+            except ImportError:
+                global_generator_model = "OpenAI MCQ"  # 기본값 설정
 
         torch.cuda.empty_cache()
         self.search_manager = vector_store_manager
         self.history: List[Tuple[str, str]] = []
-        self.model = global_generator_model  # 생성기용 모델 사용
+        
+        # global_generator_model 안전 처리
+        if isinstance(global_generator_model, list):
+            self.model = global_generator_model[0] if global_generator_model else "OpenAI MCQ"
+        elif not isinstance(global_generator_model, str):
+            self.model = str(global_generator_model)
+        else:
+            self.model = global_generator_model  # 생성기용 모델 사용
         self.tokenizer = None
         self.model_type = None
         self.openai_api_key = None
@@ -356,13 +369,23 @@ Answer:"""
         else:
             return "Unsupported model type. Please select a valid model type."
 
-    def search_news(self, model_type, query: str, top_k: int, date_info: str, pos=True) -> str:
+    def search_news(self, model_type, query: str, top_k: int, date_info: str, pos=True, use_metadata=True) -> str:
         if not query.strip():
             return "Please enter a valid query."
         
+        # model_type 안전 처리
+        if isinstance(model_type, list):
+            model_type = model_type[0] if model_type else "OpenAI MCQ"
+        elif not isinstance(model_type, str):
+            model_type = str(model_type)
+        
         try:
-            results = self.search_manager.search_with_date(query, k=top_k, date_info=date_info)
-            print("results", results)
+            if date_info is None or date_info.strip() in ["", "None", "20000000/20000000"]:
+                results = []
+            else:
+                results = self.search_manager.search_with_date(query, k=top_k, date_info=date_info, use_metadata=use_metadata)
+                print("results", results)
+            
             output = []
             # 결과가 없을 경우
             if not results and pos:
@@ -465,7 +488,10 @@ Keywords:"""
                 return final_context
 
             # 스마트 컨텍스트 추출
-            context = extract_relevant_context(all_content, query)
+            if all_content.strip() == "":
+                context = ""
+            else:
+                context = extract_relevant_context(all_content, query)
             
             # 디버깅: 컨텍스트 내용 확인
             print(f"[DEBUG] Original content length: {len(all_content)}")
@@ -476,17 +502,12 @@ Keywords:"""
             print(context)
             print(f"--- EXTRACTED CONTEXT END ---")
 
-            context_chunks = create_chunks(context, chunk_size=1000, overlap=500)
+
+            # context_chunks = create_chunks(context, chunk_size=1000, overlap=500)
 
             # 결과만 출력
-            answer_list = []
+            # answer_list = []
             if not pos:
-                # for c, chunk in enumerate(context_chunks):
-                #     print(f"[DEBUG] Context chunk {c+1} length: {len(chunk)}")
-                #     answer_part = self.generate_answer(model_type, query, chunk)
-                #     print(f"[DEBUG] Generated answer part {c+1}: {answer_part[:100]}...")  # 답변 미리보기
-                #     if 'i don\'t know' in answer_part.lower():
-                #         answer_list.append(answer_part)
 
                 print(f"[DEBUG] Find Model Type and Query: {model_type}, {query}")
                 answer = self.generate_answer(model_type, query, context)

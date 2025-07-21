@@ -22,7 +22,7 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 # os.environ["CUDA_VISIBLE_DEVICES"] = "6"
 
 # GPU 메모리 관리 설정
-if torch.cuda.is_available():
+if torch.cuda.is_available(): 
     torch.cuda.empty_cache()
     print(f"GPU 메모리: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB 사용 가능")
 

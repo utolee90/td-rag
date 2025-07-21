@@ -14,6 +14,8 @@ import warnings
 import json
 import torch
 
+from utils import analyze_qa_type
+
 warnings.filterwarnings("ignore")
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
@@ -99,6 +101,7 @@ def initialize_manager():
     )
 
     # 검색 모델 미리 로드
+    '''
     if global_retriever is None or global_retriever_model is None or global_tokenizer is None:
         print("Loading retrieval models...")
         retriever, retriever_model, tokenizer = load_model(
@@ -110,7 +113,7 @@ def initialize_manager():
         global_retriever_model = retriever_model
         global_tokenizer = tokenizer
         print("Retrieval models loaded successfully")
-
+    '''
     base_dir = Path("faiss_indexes_gcs")  # 임시 FAISS DB 경로 수정
     sub_dirs = [
         d for d in base_dir.iterdir() 
@@ -125,19 +128,35 @@ def initialize_manager():
     global_manager = VectorStoreManager(embeddings, base_dir)
 
     # 모델 워밍업 실행
-    warmup_models()
+    # warmup_models()
 
     return global_manager
 
 # FAISS DB에 넣기
-def process_uploaded_files(files, use_type='qa'):
+def process_uploaded_files(files, use_type='No Retriever with No Metadata', question_type='MCQ'): 
+    """파일을 처리하고, 질문 유형에 따라 분석 및 인덱싱하는 함수
+    Args:
+        files (list): 처리할 파일 목록
+        use_type (str): 사용할 리트리버 유형 
+        ('Retriever Only', 'Retriever with Metadata', 'No Retriever with Metadata', 'No Retriever with No Metadata')
+        question_type (str): 질문 유형 (MCQ 또는 Generate)
+    """
+
     global global_manager, global_api_key
     if global_manager is None:
         global_manager = initialize_manager()
 
+    # question_type이 리스트인 경우 첫 번째 요소 사용
+    if isinstance(question_type, list):
+        question_type = question_type[0] if question_type else 'MCQ'
+    
+    # use_type이 리스트인 경우 첫 번째 요소 사용  
+    if isinstance(use_type, list):
+        use_type = use_type[0] if use_type else 'No Retriever with No Metadata'
+
     if not files:
         return None, "Please upload at least one file."
-
+    
     processed_data = {
         "Number_of_indexes": len(files),
         "Index_by_date": {},
@@ -147,8 +166,17 @@ def process_uploaded_files(files, use_type='qa'):
     total_docs = 0
     progress_html = ""
     processed_list = [] # tlfgod
-
+    
+    # 함수 호출
+    from utils import process_openai_generate, process_openai_mcq
     try:
+        search_interface = SearchInterface(global_manager) # 사전에 미리 설정
+        search_interface.openai_api_key = global_api_key # OpenAI API 키 설정
+
+        import openai
+        client = openai.OpenAI(api_key=global_api_key) # api 키 설정
+
+        # 파일 처리 시작
         for file_idx, file in enumerate(files, 1):
 
             progress_html += f"<p>Processing File {file_idx}/{len(files)}: {file.name}, Process : {use_type}</p>"
@@ -159,34 +187,44 @@ def process_uploaded_files(files, use_type='qa'):
             # news_data key analysis
             assert isinstance(news_data, list), "News data should be a list."
             assert all(isinstance(news, dict) for news in news_data), "Each news item should be a dictionary."
-            print(news_data[0].keys())
+            # print(news_data[0].keys())
 
-            # 필수 키 확인 # 다음 세 리스트의 페어 중 하나는 반드시 있어야 함
-            # 기본적으로 뉴스 데이터 -> DB에 저장
-            if use_type.lower() in ['retrieve', 'faiss']:
-                # 기본적으로 url, title, text/content, authors, publish_date
-                if "search_result" in list(news_data[0].keys()):
-                    print("NEWSKEYS")     
-                    assert "text" in news_data[0]["search_result"][0], "뉴스 데이터의 'search_result' 항목에 'text' 키가 있어야 합니다."
-                    news_date_temp = [news["search_result"] for news in news_data]
-                    news_data = [item for sublist in news_date_temp for item in sublist]  # flatten list
-                    with open("news_data_temp_flattened.json", "w", encoding="utf-8") as f:
-                        json.dump(news_data, f, ensure_ascii=False, indent=4)
+            # 파라미터 타입 확인 및 변환
+            use_type_str = str(use_type) if use_type else 'No Retriever with No Metadata'
+            question_type_str = str(question_type) if question_type else 'MCQ'
 
+            use_metadata = True if use_type_str.lower() in ['retriever with metadata', 'no retriever with metadata'] else False
+            
+            analyzed_news_data = []
+            # analyze qa 함수 이용해서 처리
+            qa_name = "realtimeqa"  # 기본 QA 이름 임시로 설정
+            for news in news_data:
+                analyzed_news_data.append(analyze_qa_type(news, qa_name=qa_name, question_type=question_type_str, use_type=use_type_str))
+
+            # use_type에 따라 처리 방식 결정 - Retrieve로 시작할 때 저장
+            if "Retriever" == use_type_str[0:9]:
+                # 필수 키 확인 # 다음 세 리스트의 페어 중 하나는 반드시 있어야 함
+                # 기본적으로 뉴스 데이터 -> DB에 저장
+                # 데이터 가져오기 
+                # key - 키 통일 id, query, source, date, url, answers
                 # 날짜별 그룹화
                 date_groups = {}
                 for news_idx, news in enumerate(tqdm(news_data, desc="Processing news data")):
-                    print("news keys", news.keys())
-                    date = news.get('date', news.get('question_date', news.get('publish_date', '20000000')))
+                    # print("news keys", news.keys())
+                    part_date = analyze_qa_type(news, qa="realtimeqa", question_type=question_type_str, use_type=use_type_str)
+                    date = part_date.get('date', '20000000') # 기본값 설정
                     if isinstance(date, str):
                         date = process_date_string(date)
                     elif isinstance(date, datetime.date):
                         date = date.strftime("%Y%m%d")
                     else:
-                        date = '20000000'  # 기본값 설정
+                        date = '20000000' if use_metadata else '20000000_nm' # 기본값 설정
+                    # date_group 키 이름 바꾸기
+                    if use_metadata == False:
+                        date = f"{date}_nm" # no metadata 접두어 추가
                     if date not in date_groups:
                         date_groups[date] = []
-                    date_groups[date].append(news)
+                    date_groups[date].append(part_date)
 
                     if news_idx % max(1, len(news_data)//10) == 0:
                         progress = (news_idx + 1) / len(news_data) * 100
@@ -199,24 +237,33 @@ def process_uploaded_files(files, use_type='qa'):
                 }
                 total_docs += len(news_data)
 
+                # make news index
                 progress_html += f"<p>Creating Indexes... ({len(date_groups)})</p>"
                 yield processed_data, progress_html
 
+                # 날짜별로 인덱싱 및 문서 처리
                 for date_idx, (date, articles) in enumerate(date_groups.items(), 1):
                     progress_html += f"<p>Making {date} date index... ({date_idx}/{len(date_groups)})</p>"
                     yield processed_data, progress_html
 
-                    # articles -> 
-                    """{'question_id': '20250516_0_nota', 'question_date': '2025/05/16', 'question_source': 'CNN', 'question_url': 'https://edition.cnn.com/interactive/2025/05/us/cnn-5-things-news-quiz-may-16-sec/', 'question_sentence': 'The Qatari royal family has offered President Donald Trump which of the following expensive gifts?', 'choices': ['An armored Rolls-Royce', 'A luxury jet to replace Air Force One', 'A penthouse apartment in Doha', 'The Millennium Star diamond'], 'answer': ['1'], 'evidence': '<p class="_question-block_answer-response__copy">Trump said the Defense Department <a target="_blank" href="https://www.cnn.com/2025/05/11/politics/trump-luxury-jet-qatar-air-force-one">plans to accept the Boeing 747-8 jet</a> and retrofit it to be used as Air Force One, which raises substantial ethical and legal questions.</p>'}"""
+                    # articles -> 획일화
+                    """{
+                        'id': '20250516_0_nota', 
+                        'date': '2025/05/16', 
+                        'source': 'CNN', 
+                        'url': 'https://edition.cnn.com/interactive/2025/05/us/cnn-5-things-news-quiz-may-16-sec/', 
+                        'query': 'The Qatari royal family has offered President Donald Trump which of the following expensive gifts?', 
+                        'answer': ['1']
+                    }"""
                     article_objs = [] # 각 문서에서 document 작성 -> question_sentence -> search_result
                     for article in tqdm(articles, desc=f"Processing articles for date {date}"):
                         print(f"[DEBUG] Articles for date {date}: {article}")  # 첫 번째 기사만 출력
-                        query = article.get('question_sentence', article.get('text', ''))
+                        query = article.get('query', "")
                         if not query:
                             continue
                         # find search_result from query by retrieve_single_question
                         top_k = 5
-                        # 전역 모델 사용
+                        # 전역 모델 사용해서 호출
                         global global_retriever, global_retriever_model, global_tokenizer
                         
                         if global_retriever is None or global_retriever_model is None or global_tokenizer is None:
@@ -227,7 +274,8 @@ def process_uploaded_files(files, use_type='qa'):
                                 device=device
                             )
                         
-                        end_date = article.get('question_date', article.get('date', '20000000'))
+                        
+                        end_date = article.get('date', '20000000')
                         if isinstance(end_date, str):
                             end_date = process_date_string(end_date)
                         elif isinstance(end_date, datetime.date):
@@ -235,9 +283,12 @@ def process_uploaded_files(files, use_type='qa'):
                         else:
                             end_date = '20000000'
 
+                        if not use_metadata:
+                            end_date = f"{end_date}_nm"
+
                         search_result = retrieve_single_question(
                             query, global_retriever_model, global_retriever, global_tokenizer, GCS_KEY, ENGINE_KEY, 
-                            top_k=top_k, start_date=None, end_date=end_date
+                            top_k=top_k, start_date=None, end_date=end_date, use_metadata=use_metadata
                         )
 
                         if not search_result:
@@ -261,152 +312,121 @@ def process_uploaded_files(files, use_type='qa'):
                     "List_of_generated_date_indexes": list(date_groups.keys())
                 }
             
-            # realtimeqa 프로세스 처리
-            elif use_type.lower() in ['qa', 'realtimeqa', 'realtime', 'cnnqa', 'newsqa']:
-                answers = [] # 답변 목록
-                scores = []
-                answer_objs = [] # 전체 목록
-                
-                progress_html += f"<p>Starting QA processing for {len(news_data)} questions...</p>"
-                yield processed_data, progress_html
-                
-                res_text = ""
-                for news_idx, news in enumerate(tqdm(news_data, desc="Processing news data")):
-                    res_obj = dict()  # 각 뉴스에 대한 결과 객체 초기화
-                    # print("news keys", news.keys())
-                    
-                    # question_ts 타임스탬프 처리
-                    if 'question_ts' in news:
-                        ts = news['question_ts']
-                        if isinstance(ts, (int, float)):
-                            # UNIX 타임스탬프인 경우 (초 또는 밀리초)
-                            if ts > 1e10:  # 밀리초 타임스탬프인 경우
-                                ts = ts / 1000
-                            date = datetime.datetime.fromtimestamp(ts).strftime("%Y%m%d")
-                        elif isinstance(ts, str):
-                            # 문자열 타임스탬프인 경우
-                            try:
-                                # ISO 형식 시도 (예: 2024-01-01T00:00:00Z)
-                                if 'T' in ts:
-                                    parsed_date = datetime.datetime.fromisoformat(ts.replace('Z', '+00:00'))
-                                    date = parsed_date.strftime("%Y%m%d")
-                                # 숫자 문자열인 경우 (예: "1640995200")
-                                elif ts.isdigit():
-                                    timestamp = float(ts)
-                                    if timestamp > 1e10:  # 밀리초
-                                        timestamp = timestamp / 1000
-                                    date = datetime.datetime.fromtimestamp(timestamp).strftime("%Y%m%d")
-                                else:
-                                    # 다른 날짜 형식 시도
-                                    date = process_date_string(ts)
-                            except (ValueError, OSError) as e:
-                                print(f"Warning: Could not parse timestamp {ts}: {e}")
-                                date = process_date_string(str(ts))
-                        else:
-                            # 기타 형식
-                            date = str(ts)[:8] if len(str(ts)) >= 8 else '20000000'
-                    else:
-                        date = news.get('date', news.get('question_date', news.get('publish_date', '20000000')))
-                        if isinstance(date, str):
-                            date = process_date_string(date)
-                        elif isinstance(date, datetime.date):
-                            date = date.strftime("%Y%m%d")
-                        else:
-                            date = '20000000'
-                            
-                    end_date = date
-                    # start_date = None
-                    start_date = compute_relative_date(end_date, -30)  # 최근 30일로 설정
-                    query = news.get('question_sentence', news.get('text', ''))
-                    # query modification
+            # 답변 처리 - 모든 경우에 해결
+            answers = [] # 답변 목록 
+            scores = []
+            answer_objs = [] # 전체 목록
+            context = "" # 우선 가져오지 않을 때는 빈문자열로 처리
 
-                    if not query:
-                        continue
-                    
-                    # 진행 상황 업데이트
-                    if news_idx % max(1, len(news_data)//10) == 0:
-                        progress = (news_idx + 1) / len(news_data) * 100
-                        progress_html += f"<p>Processing QA: {progress:.1f}% ({news_idx + 1}/{len(news_data)})</p>"
-                        yield processed_data, progress_html
-                        
-                    # find search_result from query by search_news
-                    top_k = 5
-                    # 전역 모델 사용
-                    search_interface = SearchInterface(global_manager)
-                    search_interface.openai_api_key = global_api_key # OpenAI API 키 설정
-                    # 선택지 수정
-                    choices = news.get('choices', [])
-                    answer_index = news.get('answer', [])
-                    if not choices or not answer_index:
-                        print(f"No choices or answer index for query: {query}")
-                        continue
-                    # 선택지 문자열로 변환
-                    formatted_choices = ", ".join([f"{i}. {choice}" for i, choice in enumerate(choices)])
-                    modified_query = f"Question : {query} \nChoices : {formatted_choices} \nAnswer(the number of the correct answer):" # 선택형
-                    # modified_query = f"Question: {query}\n Answer(A word or phrase fitting the question):"
-                    print("GLOBAL GENERATOR MODEL", global_generator_model)
-                    answer = search_interface.search_news(
-                        global_generator_model,
-                        modified_query, 
-                        top_k=top_k,
-                        date_info="{}/{}".format(start_date, end_date),
-                        pos=False
+            progress_html += f"<p>Starting QA processing for {len(news_data)} questions...</p>"
+            yield processed_data, progress_html
+
+            # news_idx, news 기준 답변 {query -> openai -> answer}
+
+            for news_idx, news in enumerate(tqdm(analyzed_news_data, desc="Processing news data")):
+                res_obj = dict() # 답변 형식 확인하기 
+                # key - id, query, answers
+                # 답변 구하기
+                query = news.get('query') # 
+                if not query:
+                    print(f"No query found for news: {news}")
+                    continue
+
+                res_obj['id'] = news.get('id', f"{news_idx}_{uuid4().hex[:8]}")  # id 생성
+                res_obj['query'] = query
+                res_obj['score'] = 0.5 # 기본 점수 설정
+                # find answer from query
+                if question_type_str.lower() == "generate":
+                    # 생성형 질문
+                    answer = process_openai_generate(
+                        query, 
+                        context, 
+                        client=client
                     )
-                    score = news.get('score', 0.0)
-                    answers.append(answer)
-                    scores.append(score)  # score가 없으면 0.0으로 설정
-                    
-                    res_obj["question_id"] = news.get('question_id', f"{date}_{uuid4().hex[:8]}")
-                    res_obj["prediction"] = [answer]
-                    res_obj["score"] = str(score)
-                    answer_objs.append(res_obj)  # 전체 답변 객체에 추가
-                    res_text += json.dumps(res_obj, ensure_ascii=False) + "\n"
+                elif question_type_str.lower() == "mcq":
+                    # 선다형 질문
+                    answer = process_openai_mcq(
+                        query, 
+                        context,
+                        choices=news.get('choices', []),
+                        client=client
+                    )
+                else:
+                    print(f"Unsupported question type: {question_type_str}")
+                    continue
 
-                # 정확도 accuracy 사용 
-                try:
-                    print(f"Evaluating {len(answer_objs)} answers against {len(news_data)} news data...")
-                    print(answer_objs[:5])  # 디버깅용 출력
-                    print(news_data[:5])  # 디버깅용 출력
-                    if global_generator_model.lower() == "openai mcq":
-                        eval_results = accuracy(answer_objs, news_data) # 정확도 선다형
-                    elif global_generator_model.lower() == "openai":
-                        eval_results = gen_eval(answer_objs, news_data) # 정확도 선택형
-                    
-                    # 결과를 문자열로 변환하여 저장
-                    if isinstance(eval_results, dict):
-                        # 딕셔너리인 경우 주요 정보만 추출
+                if not answer:
+                    answer = ["0"]  # 기본값 설정
+                elif isinstance(answer, str):
+                    answer = [answer]
+                
+                res_obj['answer'] = answer
+                res_obj['prediction'] = answer  # 예측 결과로 답변 사용
+                answers.append(answer)
+                answer_objs.append(res_obj)
+
+                part_progress_html = progress_html + f"<p>Processed question {news_idx + 1}/{len(analyzed_news_data)}: {query}</p>"
+                yield processed_data, part_progress_html
+
+            # 정확도 accuracy 사용
+            try:
+                print(f"Evaluating {len(answer_objs)} answers against {len(news_data)} news data...")
+                print(answer_objs[:5])  # 디버깅용 출력
+                print(news_data[:5])  # 디버깅용 출력
+                
+                # global_generator_model이 리스트인 경우 첫 번째 요소 사용
+                model_name = global_generator_model
+                if isinstance(global_generator_model, list):
+                    model_name = global_generator_model[0] if global_generator_model else "openai mcq"
+                elif not isinstance(global_generator_model, str):
+                    model_name = str(global_generator_model)
+                
+                if question_type_str == "MCQ":
+                    eval_results = accuracy(answer_objs, news_data) # 정확도 선다형
+                elif question_type_str == "Generate":
+                    eval_results = gen_eval(answer_objs, news_data) # 주관식 
+                
+                # 결과를 문자열로 변환하여 저장
+                if isinstance(eval_results, dict):
+                    # 딕셔너리인 경우 주요 정보만 추출
+                    total_questions = eval_results.get('total', len(news_data))
+                    if question_type_str == "MCQ":
                         accuracy_score = eval_results.get('accuracy', 'N/A')
-                        total_questions = eval_results.get('total', len(news_data))
                         correct_answers = eval(accuracy_score) * int(total_questions) if isinstance(accuracy_score, str) else accuracy_score * int(total_questions)
                         # correct_answers = eval_results.get('correct', 'N/A')
                         result_str = f"File: {file.name} - Accuracy: {accuracy_score}, Correct: {correct_answers}/{total_questions}"
-                    else:
-                        result_str = f"File: {file.name} - Result: {str(eval_results)}"
-                    
-                    processed_list.append(result_str)
-                    print(f"✅ Evaluation completed for {file.name}: {result_str}")
+                    elif question_type_str == "Generate":
+                        em_score = eval_results.get('em', 0)
+                        f1_score = eval_results.get('f1', 0)
+                        result_str = f"File: {file.name} - EM: {em_score}, F1: {f1_score}, Total: {total_questions}"
+                
+                else:
+                    result_str = f"File: {file.name} - Result: {str(eval_results)}"
+                
+                processed_list.append(result_str)
+                print(f"✅ Evaluation completed for {file.name}: {result_str}")
 
-                    if global_generator_model.lower() == "openai mcq":
-                        accuracy_report_file = f"results/accuracy_report_{file.name.split('/')[-1]}"
-                    elif global_generator_model.lower() == "openai":
-                        accuracy_report_file = f"results/accuracy_report_{file.name.split('/')[-1].replace('.json', '_gen.json')}"
-                    accuracy_reports = make_accuracy_reports(answer_objs, news_data, file_name=accuracy_report_file)
-                    print("accuracy_reports")
-                    for report in accuracy_reports[:5]:
-                        print(report)
-                    
-                except Exception as eval_error:
-                    error_str = f"File: {file.name} - Evaluation Error: {str(eval_error)}"
-                    processed_list.append(error_str)
-                    print(f"⚠️ Evaluation failed for {file.name}: {eval_error}")
+                if question_type_str == "MCQ":
+                    accuracy_report_file = f"results/accuracy_report_{file.name.split('/')[-1]}"
+                elif question_type_str == "Generate":
+                    accuracy_report_file = f"results/accuracy_report_{file.name.split('/')[-1].replace('.json', '_gen.json')}"
+                accuracy_reports = make_accuracy_reports(answer_objs, news_data, file_name=accuracy_report_file)
+                print("accuracy_reports")
+                for report in accuracy_reports[:5]:
+                    print(report)
+                
+            except Exception as eval_error:
+                error_str = f"File: {file.name} - Evaluation Error: {str(eval_error)}"
+                processed_list.append(error_str)
+                print(f"⚠️ Evaluation failed for {file.name}: {eval_error}")
                 
 
         status_msg = f"? Processed Finished:\n {len(files)} files, {total_docs} documents processed."
-        if use_type.lower() in ['qa', 'realtimeqa', 'realtime', 'cnnqa', 'newsqa']:
-            status_msg += f"\n{len(processed_list)} evaluations completed."
-            if processed_list:
-                joined_list = '\n'.join(processed_list)
-                status_msg += f"\nEvaluation Results:\n{joined_list}"
+        
+        status_msg += f"\n{len(processed_list)} evaluations completed."
+        if processed_list:
+            joined_list = '\n'.join(processed_list)
+            status_msg += f"\nEvaluation Results:\n{joined_list}"
 
         progress_html += f"<p style='color: green;'>{status_msg}</p>"
 
@@ -454,8 +474,8 @@ def make_accuracy_reports(pred_data, gold_data, file_name="results/metadata_extr
                 golds = [gold["choices"][int(idx)] for idx in gold["answer"]]
                 golds = [' '.join(perm) for perm in list(itertools.permutations(golds))]
                 res_obj["answer"] = [answer_choices[int(num)] for num in answer_num]
-                res_obj["em"] = exact_match_score(pred, golds[0])
-                res_obj["f1"] = f1_score(pred, golds[0])
+                res_obj["em"] = exact_match_score(pred[0], golds[0])
+                res_obj["f1"] = f1_score(pred[0], golds[0])
         accuracy_results.append(res_obj)
     
     accuracy_objs = [json.dumps(res, ensure_ascii=False) for res in accuracy_results]
@@ -550,6 +570,23 @@ def create_gradio_interface():
         # 파일 업로드 섹션
         gr.Markdown("### File Upload For Retreival and Saving for FAISS")
         with gr.Row():
+            # data 
+            gr.Markdown("### Select Date Range")
+            date_range = gr.Textbox(label="Date Range - YYMMDD/YYMMDD")
+
+        with gr.Row():
+
+            with gr.Column():
+                exp_type = gr.Radio(
+                    choices=["No Retriever and No Metadata", "No Retriever with Metadata", "Retriever Only", "Retriever with Metadata"],
+                    label="Select the type of experiment",
+                    value="No Retriever and No Metadata",
+                )
+                question_type = gr.Radio(
+                    choices=["MCQ", "Generate"],
+                    label="Select the type of question",
+                    value="MCQ",
+                )
             
             with gr.Column():
                 file_output = gr.JSON(label="Current File Status")
@@ -683,7 +720,7 @@ def create_gradio_interface():
                         {"role": "user", "content": f"Please deduce the results from the following query: {query_input}"},
                     ],
                     max_tokens=1000,
-                    temperature=0.5
+                    temperature=0.2
                 )
 
                 llm_results = response.choices[0].message.content.strip()
@@ -724,7 +761,7 @@ def create_gradio_interface():
         # 파일 업로드 버튼 핸들러
         upload_button.change(
             fn=process_uploaded_files,
-            inputs=[upload_button],
+            inputs=[upload_button, exp_type, question_type],
             outputs=[file_output, status_output],
             show_progress=True
         )

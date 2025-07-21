@@ -1,0 +1,5 @@
+{"question_id": "20220610_0_nota", "type": "generate", "prediction": ["No specific answer available."], "answer": ["None of the above"], "em": false, "f1": 0, "score": 0.5}
+{"question_id": "20220610_1_nota", "type": "generate", "prediction": ["The facility was closed due to safety concerns and contamination issues."], "answer": ["Bacteria outbreak"], "em": false, "f1": 0, "score": 0.5}
+{"question_id": "20220610_2_nota", "type": "generate", "prediction": ["Minjee Lee"], "answer": ["Minjee Lee"], "em": true, "f1": 1.0, "score": 0.5}
+{"question_id": "20220610_3_nota", "type": "generate", "prediction": ["The California ruling allows the California red-legged frog to be considered a fish."], "answer": ["Bumblebee"], "em": false, "f1": 0, "score": 0.5}
+{"question_id": "20220610_4_nota", "type": "generate", "prediction": ["No specific answer available."], "answer": ["Kohl’s"], "em": false, "f1": 0, "score": 0.5}
