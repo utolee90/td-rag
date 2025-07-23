@@ -17,6 +17,7 @@ news_data = [{'question_id': '20220610_0_nota', 'question_date': '2022/06/10', '
 
 from evaluate import *
 
+print(exact_match_score(answer_obj[0]["prediction"][0], news_data[0]["choices"][int(news_data[0]["answer"][0])]))
 print(gen_eval(answer_obj, news_data))
 
 def make_accuracy_reports(pred_data, gold_data, file_name="results/metadata_extraction.jsonl"):

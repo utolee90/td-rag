@@ -14,6 +14,7 @@ import openai
 
 from retrieval.dpr import run_dpr_question, load_model
 from retrieval.gcs import search as gcs_search, parse_article
+from reranker import SearchReranker, rerank_with_cohere, rerank_with_custom_scoring
 
 class DocumentV2(BaseModel):
     """Pydantic v2 호환 Document 클래스"""
@@ -470,16 +471,23 @@ def classify_news_category(text, model, tokenizer):
     
     return NEWS_CATEGORY_LISTS[predicted_class] if predicted_class < len(NEWS_CATEGORY_LISTS) else "Unknown"
 
-def retrieve_single_question(question, model, retriever, tokenizer, key, engine, top_k=10, start_date=None, end_date=None, use_metadata=True):
+def retrieve_single_question(question, model, retriever, tokenizer, key, engine, top_k=10, start_date=None, end_date=None, use_metadata=True, use_reranking=True, rerank_method="custom", rerank_api_key=None):
     """
     단일 질문에 대해 DPR과 GCS를 사용하여 검색 결과를 반환합니다.
     
     :param question: 검색할 질문 문자열
     :param model: DPR 모델
     :param retriever: DPR 리트리버
+    :param tokenizer: 토크나이저
     :param key: GCS API 키
     :param engine: GCS 엔진 ID
     :param top_k: 검색 결과의 상위 K개를 반환
+    :param start_date: 시작 날짜 (YYYYMMDD)
+    :param end_date: 종료 날짜 (YYYYMMDD)
+    :param use_metadata: 메타데이터 사용 여부
+    :param use_reranking: reranking 사용 여부
+    :param rerank_method: reranking 방법 ("cohere", "openai", "cross_encoder", "custom")
+    :param rerank_api_key: reranking API 키 (cohere 또는 openai용)
     :return: 검색 결과 리스트
     """
     # question이 string이 아닌 경우 별도 처리
@@ -495,6 +503,9 @@ def retrieve_single_question(question, model, retriever, tokenizer, key, engine,
     if not search_result:
         return []
 
+    # debugging start_date and end date
+    print("start_date:", start_date, "end_date:", end_date)
+
     # GCS로부터 추가 정보 가져오기
     gcs_results = gcs_search(new_question, key, engine, top_k=top_k)
     gcs_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y/%m/%d/%H:%M")
@@ -503,7 +514,8 @@ def retrieve_single_question(question, model, retriever, tokenizer, key, engine,
     # 결과 병합 및 정리
     for article in gcs_results:
         try:
-            publish_date = article.get("publish_date", "2018/12/31")
+            new_end_date = end_date if "_nm" not in end_date else end_date.replace('_nm', '')
+            publish_date = article.get("publish_date", new_end_date) # 날짜 없으면 end_date 사용
             publish_date = process_date_string(publish_date)  # 날짜 문자열을 'YYYYMMDD' 형식으로 변환
             article["text"], article["authors"], article["publish_date"] = parse_article(article["url"])
             doc_chunks = create_chunks(article["text"], chunk_size=1000, overlap=500)
@@ -523,7 +535,7 @@ def retrieve_single_question(question, model, retriever, tokenizer, key, engine,
                         new_gcs_result_obj = {
                             "doc_id": article.get("doc_id", str(uuid4())),
                             "text": chunk,
-                            "publish_date": article.get("publish_date", "2018/12/31"),
+                            "date": publish_date,
                             "query": question,
                             "url": article.get("url", ""),
                             "title": article.get("title", ""),
@@ -544,15 +556,31 @@ def retrieve_single_question(question, model, retriever, tokenizer, key, engine,
     print("modified gcs_results", new_gcs_results)
     print(len(new_gcs_results), "개 문서가 검색되었습니다.")
     search_result = new_gcs_results + search_result
-    # 중복 제거
-    seen_urls = set()
-    unique_results = []
-    for result in search_result:
-        if result.get('url', None) and result['url'] not in seen_urls:
-            seen_urls.add(result['url'])
-            unique_results.append(result)
-    
-    return unique_results[:top_k]  # 상위 K개 결과 반환, top_k가 None이면 전체 반환
+
+    # Reranking 적용
+    if use_reranking and search_result:
+        print(f"Applying reranking with method: {rerank_method}")
+        try:
+            if rerank_method == "cohere" and rerank_api_key:
+                search_result = rerank_with_cohere(new_question, search_result, rerank_api_key, top_k)
+            elif rerank_method == "custom":
+                search_result = rerank_with_custom_scoring(new_question, search_result, top_k)
+            elif rerank_method == "openai" and rerank_api_key:
+                from reranker import rerank_with_openai
+                search_result = rerank_with_openai(new_question, search_result, rerank_api_key, top_k)
+            elif rerank_method == "cross_encoder":
+                from reranker import rerank_with_cross_encoder
+                search_result = rerank_with_cross_encoder(new_question, search_result, top_k=top_k)
+            else:
+                print(f"Reranking method '{rerank_method}' not available or missing API key, using original order")
+                search_result = search_result[:top_k]
+        except Exception as e:
+            print(f"Reranking failed: {e}, using original order")
+            search_result = search_result[:top_k]
+    else:
+        search_result = search_result[:top_k]
+
+    return search_result
 
 
 def compare_earlier_date(date1, date2):
@@ -768,3 +796,8 @@ def process_openai_mcq(question: str, context: str, choices=[], client=None, api
         error_msg = f"OpenAI MCQ API Error: {str(e)}"
         print(f"[DEBUG] {error_msg}")
         return error_msg
+
+
+def rerank_documents(question, documents, model, tokenizer, top_k=5):
+    """문서 reranking 함수 (향후 구현)"""
+    pass

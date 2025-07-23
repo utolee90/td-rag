@@ -380,12 +380,8 @@ Answer:"""
             model_type = str(model_type)
         
         try:
-            if date_info is None or date_info.strip() in ["", "None", "20000000/20000000"]:
-                results = []
-            else:
-                results = self.search_manager.search_with_date(query, k=top_k, date_info=date_info, use_metadata=use_metadata)
-                print("results", results)
-            
+            results = self.search_manager.search_with_date(query, k=top_k, date_info=date_info, use_metadata=use_metadata)
+            print("results", results)
             output = []
             # 결과가 없을 경우
             if not results and pos:
@@ -488,10 +484,7 @@ Keywords:"""
                 return final_context
 
             # 스마트 컨텍스트 추출
-            if all_content.strip() == "":
-                context = ""
-            else:
-                context = extract_relevant_context(all_content, query)
+            context = extract_relevant_context(all_content, query)
             
             # 디버깅: 컨텍스트 내용 확인
             print(f"[DEBUG] Original content length: {len(all_content)}")
@@ -502,12 +495,17 @@ Keywords:"""
             print(context)
             print(f"--- EXTRACTED CONTEXT END ---")
 
-
-            # context_chunks = create_chunks(context, chunk_size=1000, overlap=500)
+            context_chunks = create_chunks(context, chunk_size=1000, overlap=500)
 
             # 결과만 출력
-            # answer_list = []
+            answer_list = []
             if not pos:
+                # for c, chunk in enumerate(context_chunks):
+                #     print(f"[DEBUG] Context chunk {c+1} length: {len(chunk)}")
+                #     answer_part = self.generate_answer(model_type, query, chunk)
+                #     print(f"[DEBUG] Generated answer part {c+1}: {answer_part[:100]}...")  # 답변 미리보기
+                #     if 'i don\'t know' in answer_part.lower():
+                #         answer_list.append(answer_part)
 
                 print(f"[DEBUG] Find Model Type and Query: {model_type}, {query}")
                 answer = self.generate_answer(model_type, query, context)

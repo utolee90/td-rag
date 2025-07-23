@@ -61,6 +61,9 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.docstore.in_memory import InMemoryDocstore
 
+import openai
+import time
+
 # utils.py
 from utils import (
     load_news_data, create_documents, create_faiss_index, create_chunks, process_date_string, retrieve_single_question, compute_relative_date
@@ -70,7 +73,7 @@ from uuid import uuid4
 from evaluate import accuracy, gen_eval
 
 # keys.py
-from keys import GCS_KEY, ENGINE_KEY, OPENAI_API_KEY, MODEL_PATH, MODEL_NAMES, EXTRACTOR_MODEL_PATH
+from keys import GCS_KEY, ENGINE_KEY, OPENAI_API_KEY, MODEL_PATH, MODEL_NAMES, EXTRACTOR_MODEL_PATH, COHERE_API_KEY
 
 global_api_key = OPENAI_API_KEY  # OpenAI API 키 설정
 
@@ -101,7 +104,6 @@ def initialize_manager():
     )
 
     # 검색 모델 미리 로드
-    '''
     if global_retriever is None or global_retriever_model is None or global_tokenizer is None:
         print("Loading retrieval models...")
         retriever, retriever_model, tokenizer = load_model(
@@ -113,7 +115,7 @@ def initialize_manager():
         global_retriever_model = retriever_model
         global_tokenizer = tokenizer
         print("Retrieval models loaded successfully")
-    '''
+
     base_dir = Path("faiss_indexes_gcs")  # 임시 FAISS DB 경로 수정
     sub_dirs = [
         d for d in base_dir.iterdir() 
@@ -128,31 +130,141 @@ def initialize_manager():
     global_manager = VectorStoreManager(embeddings, base_dir)
 
     # 모델 워밍업 실행
-    # warmup_models()
+    warmup_models()
 
     return global_manager
 
-# FAISS DB에 넣기
-def process_uploaded_files(files, use_type='No Retriever with No Metadata', question_type='MCQ'): 
-    """파일을 처리하고, 질문 유형에 따라 분석 및 인덱싱하는 함수
-    Args:
-        files (list): 처리할 파일 목록
-        use_type (str): 사용할 리트리버 유형 
-        ('Retriever Only', 'Retriever with Metadata', 'No Retriever with Metadata', 'No Retriever with No Metadata')
-        question_type (str): 질문 유형 (MCQ 또는 Generate)
-    """
+# 검색 2개 결과 출력 (성능 개선)
+def return_date_info(query_input, use_heidel_time=True, use_llm =True):
+    import time
+    import subprocess
+    import os
+    import tempfile
+    import xml.etree.ElementTree as ET
+    from typing import List, Dict, Optional
+    start_time = time.time()
 
+    # 결과 해석
+    results_output = "Results from query:\n"
+    results_output += f"Query: {query_input}\n\n"
+
+    # heidel_time 실행
+    heidel_time_dir = "/mnt/nvme02/home/tdrag/vaiv/RTRAG/heideltime"
+    jar_path = os.path.join(heidel_time_dir, "target/de.unihd.dbs.heideltime.standalone.jar")
+    lib_path = os.path.join(heidel_time_dir, "lib/*")
+    config_path = os.path.join(heidel_time_dir, "config.props")
+
+    # Create temporary input file
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp_input:
+        tmp_input.write(query_input)
+        tmp_input_path = tmp_input.name
+    
+    try:
+        # Build command
+        if use_heidel_time:
+            cmd = [
+                'java', '-cp', f"{jar_path}:{lib_path}",
+                'de.unihd.dbs.heideltime.standalone.HeidelTimeStandalone',
+                tmp_input_path,
+                '-c', config_path,
+                '-l', "english",
+                '-t', "narratives",
+                '-pos', "no"
+            ]
+
+            # execute HeidelTime
+            result = subprocess.run(
+                cmd,
+                cwd=heidel_time_dir,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            if result.returncode != 0:
+                raise RuntimeError(f"HeidelTime failed: {result.stderr}")
+            
+            # Parse the output
+            timeml_output = result.stdout # xml output
+            root = ET.fromstring(timeml_output)
+            # timexes = []
+            timexes_bases = root.findall('.//TIMEX3')
+            
+            # 결과 해석 -> 텍스트 출력
+            results_output += "### HeidelTime Results\n\n"
+            for idx, val in enumerate(timexes_bases):
+                results_output += f"Result {idx + 1}"
+                results_output += f" - Type: {val.get('type', 'NONE')} "
+                results_output += f" - Value: {val.get('value', 'NONE')} "
+                results_output += f" - Text: {val.text.strip() if val.text else ''}"
+                results_output += "\n"
+        
+    except subprocess.TimeoutExpired:
+        results_output += "\n### HeidelTime Error\n\nHeidelTime execution timed out\n"
+    except Exception as e:
+        results_output += f"\n### HeidelTime Error\n\nError: {str(e)}\n"
+    finally:
+        # Clean up temporary file
+        try:
+            if os.path.exists(tmp_input_path):
+                os.unlink(tmp_input_path)
+        except Exception:
+            pass  # 파일 삭제 실패해도 계속 진행
+
+    # local llm 실행 - (일단 GPT-4o로 활용)
+    try:
+        if use_llm and global_api_key:
+
+            client = openai.OpenAI(api_key=global_api_key)
+            query_sample = "Today is July 13, 2025. I have a meeting tomorrow at 3 PM. Last week, I visited my grandmother."
+            results_xml_output = """<?xml version="1.0"?>
+    <!DOCTYPE TimeML SYSTEM "TimeML.dtd">
+    <TimeML>
+    <TIMEX3 tid="t5" type="DATE" value="PRESENT_REF">Today</TIMEX3> is <TIMEX3 tid="t3" type="DATE" value="2025-07-13">July 13, 2025</TIMEX3>. I have a meeting <TIMEX3 tid="t6" type="DATE" value="2025-07-14">tomorrow</TIMEX3> at <TIMEX3 tid="t7" type="TIME" value="2025-07-14T15:00">3 PM.</TIMEX3> <TIMEX3 tid="t8" type="DATE" value="2025-W28">Last week</TIMEX3>, I visited my grandmother.
+
+    </TimeML>"""
+            # 쿼리 추출 
+            root = ET.fromstring(results_xml_output)
+            timexes_bases = root.findall('.//TIMEX3')
+            results_from_sample = ""
+            for idx, val in enumerate(timexes_bases):
+                results_from_sample += f"Result {idx + 1}"
+                results_from_sample += f" - Type: {val.get('type', 'NONE')} "
+                results_from_sample += f" - Value: {val.get('value', 'NONE')}"
+                results_from_sample += f" - Text: {val.text.strip() if val.text else ''}"
+                results_from_sample += "\n"
+            
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": f"Please deduce the results from the following query: {query_sample}"},
+                    {"role": "assistant", "content": f"Results: {results_from_sample}"},
+                    {"role": "user", "content": f"Please deduce the results from the following query: {query_input}"},
+                ],
+                max_tokens=1000,
+                temperature=0.2
+            )
+
+            llm_results = response.choices[0].message.content.strip()
+            results_output += "\n### LLM Deduced Results\n\n"
+            results_output += llm_results + "\n"
+
+    except ET.ParseError as e:
+        results_output += f"\n### Error in XML Parsing\n\nError: {str(e)}\n"
+    except Exception as e:
+        results_output += f"\n### Error in LLM Processing\n\nError: {str(e)}\n"
+
+    processing_time = time.time() - start_time
+    
+    # text 결과 출력
+    return results_output
+
+# FAISS DB에 넣기
+def process_uploaded_files(files, use_type='No Retriever with No Metadata', question_type='MCQ'):
     global global_manager, global_api_key
     if global_manager is None:
         global_manager = initialize_manager()
-
-    # question_type이 리스트인 경우 첫 번째 요소 사용
-    if isinstance(question_type, list):
-        question_type = question_type[0] if question_type else 'MCQ'
-    
-    # use_type이 리스트인 경우 첫 번째 요소 사용  
-    if isinstance(use_type, list):
-        use_type = use_type[0] if use_type else 'No Retriever with No Metadata'
 
     if not files:
         return None, "Please upload at least one file."
@@ -163,21 +275,23 @@ def process_uploaded_files(files, use_type='No Retriever with No Metadata', ques
         "Current_indices": {}
     }
 
+    start_time = time.time()
+
     total_docs = 0
     progress_html = ""
     processed_list = [] # tlfgod
-    
+
     # 함수 호출
     from utils import process_openai_generate, process_openai_mcq
+
     try:
-        search_interface = SearchInterface(global_manager) # 사전에 미리 설정
-        search_interface.openai_api_key = global_api_key # OpenAI API 키 설정
-
-        import openai
-        client = openai.OpenAI(api_key=global_api_key) # api 키 설정
-
-        # 파일 처리 시작
         for file_idx, file in enumerate(files, 1):
+
+            search_interface = SearchInterface(global_manager)
+            search_interface.openai_api_key = global_api_key
+
+            import openai
+            client = openai.OpenAI(api_key=global_api_key)
 
             progress_html += f"<p>Processing File {file_idx}/{len(files)}: {file.name}, Process : {use_type}</p>"
             yield processed_data, progress_html
@@ -187,22 +301,73 @@ def process_uploaded_files(files, use_type='No Retriever with No Metadata', ques
             # news_data key analysis
             assert isinstance(news_data, list), "News data should be a list."
             assert all(isinstance(news, dict) for news in news_data), "Each news item should be a dictionary."
-            # print(news_data[0].keys())
+            print(news_data[0].keys())
 
-            # 파라미터 타입 확인 및 변환
-            use_type_str = str(use_type) if use_type else 'No Retriever with No Metadata'
-            question_type_str = str(question_type) if question_type else 'MCQ'
-
-            use_metadata = True if use_type_str.lower() in ['retriever with metadata', 'no retriever with metadata'] else False
-            
+            # 분석 시계열 바꾸기
             analyzed_news_data = []
-            # analyze qa 함수 이용해서 처리
-            qa_name = "realtimeqa"  # 기본 QA 이름 임시로 설정
-            for news in news_data:
-                analyzed_news_data.append(analyze_qa_type(news, qa_name=qa_name, question_type=question_type_str, use_type=use_type_str))
+            for news_idx, news in enumerate(tqdm(news_data, desc="Processing news data")):
+                analyzed_news = analyze_qa_type(news, qa_name="realtimeqa", question_type=question_type, use_type=use_type)
+                analyzed_news_data.append(analyzed_news)
+
+            use_metadata = True if use_type.lower() in ['retriever with metadata', 'no retriever with metadata'] else False
+            use_retriever = True if use_type.lower() in ['retriever with metadata', 'retriever with no metadata', 'retriever only'] else False
 
             # use_type에 따라 처리 방식 결정 - Retrieve로 시작할 때 저장
-            if "Retriever" == use_type_str[0:9]:
+            # use_retriever가 True이면 검색 결과 저장
+            search_list = [] # 각 뉴스마다 대응하기 analyzed news_data와 1:1 대응
+            if use_retriever:
+                search_interface.retriever = global_retriever
+                search_interface.retriever_model = global_retriever_model
+                search_interface.tokenizer = global_tokenizer
+
+                for news_idx, news in enumerate(tqdm(analyzed_news_data, desc="Processing news data")):
+                    print(f"[DEBUG] Analyzed news for index {news_idx}: {news}")
+                    # query -> gcs_search 사용해서
+                    query = news.get("query", "")
+                    if not query:
+                        search_list.append([])
+                        continue
+                    # find search_result from query by retrieve_single_question
+                    top_k = 5
+                    # use_metadata에 따라 날짜 설정
+                    if use_metadata:
+                        end_date = news.get('date', '20000101')
+                        if isinstance(end_date, str):
+                            end_date = process_date_string(end_date)
+                        elif isinstance(end_date, datetime.date):
+                            end_date = end_date.strftime("%Y%m%d")
+                        else:
+                            end_date = '20000101_nm'
+                        if re.match(r"20[0-2][0-9][01][0-9][0-3][0-9]", end_date):
+                            start_date = compute_relative_date(end_date, -30)  # 30일 전
+                        else:
+                            start_date = None
+                        # query에서도 날짜 정보 사용해서 
+                        # query_context = return_date_info(query, use_heidel_time=False, use_llm=True)
+                        # query = f"Time Metadata : {query_context} is given. \nNow answer the question with given metadata  {query}" # 질문에 time_metadata 정보 삽입
+                    else:
+                        end_date = '20000101_nm'
+                        start_date = None
+                    search_result = retrieve_single_question(
+                        query, global_retriever_model, global_retriever, global_tokenizer, GCS_KEY, ENGINE_KEY,
+                        top_k=top_k, start_date=start_date, end_date=end_date, use_metadata=use_metadata,
+                        use_reranking=True,
+                        rerank_method="cohere" if COHERE_API_KEY else "custom",
+                        rerank_api_key=COHERE_API_KEY or OPENAI_API_KEY
+                    )
+                    if not search_result:
+                        print(f"No search result for query: {query}")
+                        search_list.append([])
+                        continue
+                    else:
+                        print(f"Search result for query '{query}': {search_result}")
+                        search_list.append(search_result)
+
+
+
+            """
+            # 각 뉴스 db에 저장 - 불필요
+            if "Retriever" == use_type[0:9].strip():
                 # 필수 키 확인 # 다음 세 리스트의 페어 중 하나는 반드시 있어야 함
                 # 기본적으로 뉴스 데이터 -> DB에 저장
                 # 데이터 가져오기 
@@ -210,8 +375,8 @@ def process_uploaded_files(files, use_type='No Retriever with No Metadata', ques
                 # 날짜별 그룹화
                 date_groups = {}
                 for news_idx, news in enumerate(tqdm(news_data, desc="Processing news data")):
-                    # print("news keys", news.keys())
-                    part_date = analyze_qa_type(news, qa="realtimeqa", question_type=question_type_str, use_type=use_type_str)
+                    print("news keys", news.keys())
+                    part_date = analyze_qa_type(news, qa_name="realtimeqa", question_type=question_type, use_type=use_type)
                     date = part_date.get('date', '20000000') # 기본값 설정
                     if isinstance(date, str):
                         date = process_date_string(date)
@@ -247,14 +412,14 @@ def process_uploaded_files(files, use_type='No Retriever with No Metadata', ques
                     yield processed_data, progress_html
 
                     # articles -> 획일화
-                    """{
+                    {
                         'id': '20250516_0_nota', 
                         'date': '2025/05/16', 
                         'source': 'CNN', 
                         'url': 'https://edition.cnn.com/interactive/2025/05/us/cnn-5-things-news-quiz-may-16-sec/', 
                         'query': 'The Qatari royal family has offered President Donald Trump which of the following expensive gifts?', 
                         'answer': ['1']
-                    }"""
+                    }
                     article_objs = [] # 각 문서에서 document 작성 -> question_sentence -> search_result
                     for article in tqdm(articles, desc=f"Processing articles for date {date}"):
                         print(f"[DEBUG] Articles for date {date}: {article}")  # 첫 번째 기사만 출력
@@ -288,7 +453,10 @@ def process_uploaded_files(files, use_type='No Retriever with No Metadata', ques
 
                         search_result = retrieve_single_question(
                             query, global_retriever_model, global_retriever, global_tokenizer, GCS_KEY, ENGINE_KEY, 
-                            top_k=top_k, start_date=None, end_date=end_date, use_metadata=use_metadata
+                            top_k=top_k, start_date=None, end_date=end_date, use_metadata=use_metadata,
+                            use_reranking=True, 
+                            rerank_method="cohere" if COHERE_API_KEY else "custom",
+                            rerank_api_key=COHERE_API_KEY or OPENAI_API_KEY
                         )
 
                         if not search_result:
@@ -311,17 +479,19 @@ def process_uploaded_files(files, use_type='No Retriever with No Metadata', ques
                     "Base_dir": str(global_manager.base_dir),
                     "List_of_generated_date_indexes": list(date_groups.keys())
                 }
+            """
             
             # 답변 처리 - 모든 경우에 해결
-            answers = [] # 답변 목록 
+            # elif use_type.lower() in ['qa', 'realtimeqa', 'realtime', 'cnnqa', 'newsqa']:
+            answers = [] # 답변 목록
             scores = []
             answer_objs = [] # 전체 목록
             context = "" # 우선 가져오지 않을 때는 빈문자열로 처리
 
+
             progress_html += f"<p>Starting QA processing for {len(news_data)} questions...</p>"
             yield processed_data, progress_html
-
-            # news_idx, news 기준 답변 {query -> openai -> answer}
+            
 
             for news_idx, news in enumerate(tqdm(analyzed_news_data, desc="Processing news data")):
                 res_obj = dict() # 답변 형식 확인하기 
@@ -332,18 +502,34 @@ def process_uploaded_files(files, use_type='No Retriever with No Metadata', ques
                     print(f"No query found for news: {news}")
                     continue
 
+                # context 정의
+                if use_retriever:
+                    # 검색 결과가 있는 경우
+                    search_result = search_list[news_idx]
+                    if not search_result:
+                        print(f"No search result for query: {query}")
+                        continue
+                    context = "\n".join([f"{item.get('title', 'idea')}: {item.get('text', '')}" for item in search_result])
+                else:
+                    # 검색 결과가 없는 경우 빈 문자열로 설정
+                    if use_metadata:
+                        # 메타데이터가 있으면 context를 chatgpt의 메타데이터 입력 함수 사용.
+                        context = return_date_info(query, use_heidel_time=True, use_llm=True)
+                    else:
+                        context = ""
+
                 res_obj['id'] = news.get('id', f"{news_idx}_{uuid4().hex[:8]}")  # id 생성
                 res_obj['query'] = query
                 res_obj['score'] = 0.5 # 기본 점수 설정
                 # find answer from query
-                if question_type_str.lower() == "generate":
+                if question_type.lower() == "generate":
                     # 생성형 질문
                     answer = process_openai_generate(
                         query, 
                         context, 
                         client=client
                     )
-                elif question_type_str.lower() == "mcq":
+                elif question_type.lower() == "mcq":
                     # 선다형 질문
                     answer = process_openai_mcq(
                         query, 
@@ -352,7 +538,7 @@ def process_uploaded_files(files, use_type='No Retriever with No Metadata', ques
                         client=client
                     )
                 else:
-                    print(f"Unsupported question type: {question_type_str}")
+                    print(f"Unsupported question type: {question_type}")
                     continue
 
                 if not answer:
@@ -368,12 +554,124 @@ def process_uploaded_files(files, use_type='No Retriever with No Metadata', ques
                 part_progress_html = progress_html + f"<p>Processed question {news_idx + 1}/{len(analyzed_news_data)}: {query}</p>"
                 yield processed_data, part_progress_html
 
-            # 정확도 accuracy 사용
+            """
+            for news_idx, news in enumerate(tqdm(news_data, desc="Processing news data")):
+                res_obj = dict()  # 각 뉴스에 대한 결과 객체 초기화
+                # print("news keys", news.keys())
+                
+                # question_ts 타임스탬프 처리
+                if 'question_ts' in news:
+                    ts = news['question_ts']
+                    if isinstance(ts, (int, float)):
+                        # UNIX 타임스탬프인 경우 (초 또는 밀리초)
+                        if ts > 1e10:  # 밀리초 타임스탬프인 경우
+                            ts = ts / 1000
+                        date = datetime.datetime.fromtimestamp(ts).strftime("%Y%m%d")
+                    elif isinstance(ts, str):
+                        # 문자열 타임스탬프인 경우
+                        try:
+                            # ISO 형식 시도 (예: 2024-01-01T00:00:00Z)
+                            if 'T' in ts:
+                                parsed_date = datetime.datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                                date = parsed_date.strftime("%Y%m%d")
+                            # 숫자 문자열인 경우 (예: "1640995200")
+                            elif ts.isdigit():
+                                timestamp = float(ts)
+                                if timestamp > 1e10:  # 밀리초
+                                    timestamp = timestamp / 1000
+                                date = datetime.datetime.fromtimestamp(timestamp).strftime("%Y%m%d")
+                            else:
+                                # 다른 날짜 형식 시도
+                                date = process_date_string(ts)
+                        except (ValueError, OSError) as e:
+                            print(f"Warning: Could not parse timestamp {ts}: {e}")
+                            date = process_date_string(str(ts))
+                    else:
+                        # 기타 형식
+                        date = str(ts)[:8] if len(str(ts)) >= 8 else '20000000'
+                else:
+                    date = news.get('date', news.get('question_date', news.get('publish_date', '20000000')))
+                    if isinstance(date, str):
+                        date = process_date_string(date)
+                    elif isinstance(date, datetime.date):
+                        date = date.strftime("%Y%m%d")
+                    else:
+                        date = '20000000'
+                        
+                end_date = date
+                # start_date = None
+                start_date = compute_relative_date(end_date, -30)  # 최근 30일로 설정
+                query = news.get('question_sentence', news.get('text', ''))
+                # query modification
+
+                if not query:
+                    continue
+                
+                # 진행 상황 업데이트
+                if news_idx % max(1, len(news_data)//10) == 0:
+                    progress = (news_idx + 1) / len(news_data) * 100
+                    progress_html += f"<p>Processing QA: {progress:.1f}% ({news_idx + 1}/{len(news_data)})</p>"
+                    yield processed_data, progress_html
+                    
+                # find search_result from query by search_news
+                top_k = 5
+                # 전역 모델 사용
+                search_interface = SearchInterface(global_manager)
+                search_interface.openai_api_key = global_api_key # OpenAI API 키 설정
+                # 선택지 수정
+                choices = news.get('choices', [])
+                answer_index = news.get('answer', [])
+                if not choices or not answer_index:
+                    print(f"No choices or answer index for query: {query}")
+                    continue
+                # 선택지 문자열로 변환
+                formatted_choices = ", ".join([f"{i}. {choice}" for i, choice in enumerate(choices)])
+                modified_query = f"Question : {query} \nChoices : {formatted_choices} \nAnswer(the number of the correct answer):" # 선택형
+                # modified_query = f"Question: {query}\n Answer(A word or phrase fitting the question):"
+                
+                # global_generator_model 안전 처리
+                model_name = global_generator_model
+                if isinstance(global_generator_model, list):
+                    print(f"DEBUG: global_generator_model is a list: {global_generator_model}")
+                    model_name = global_generator_model[0] if global_generator_model else "OpenAI MCQ"
+                elif not isinstance(global_generator_model, str):
+                    print(f"DEBUG: global_generator_model is not a string: {type(global_generator_model)}, value: {global_generator_model}")
+                    model_name = str(global_generator_model)
+                    
+                print("GLOBAL GENERATOR MODEL", model_name)
+                # date_info -> 날짜검색 OK retriever가 있으면, retriever가 없으면 검색 불가능한 날짜로 처리.
+                if use_type.lower()[:len("no_retriever")].strip() == "no_retriever":
+                    date_info = "20000000/20000000"  # 검색 불가능한 날짜로 설정
+                else:
+                    date_info = "{}/{}".format(start_date, end_date)
+
+                answer = search_interface.search_news(
+                    model_name,
+                    modified_query, 
+                    top_k=top_k,
+                    date_info=date_info,
+                    pos=False,
+                    use_metadata=use_metadata,
+                )
+                score = news.get('score', 0.0)
+                answers.append(answer)
+                scores.append(score)  # score가 없으면 0.0으로 설정
+                
+                res_obj["question_id"] = news.get('question_id', f"{date}_{uuid4().hex[:8]}")
+                res_obj["prediction"] = [answer]
+                res_obj["score"] = str(score)
+                answer_objs.append(res_obj)  # 전체 답변 객체에 추가
+            """
+
+            # 정확도 accuracy 사용 
             try:
                 print(f"Evaluating {len(answer_objs)} answers against {len(news_data)} news data...")
                 print(answer_objs[:5])  # 디버깅용 출력
                 print(news_data[:5])  # 디버깅용 출력
-                
+
+                #pred length
+                print("Length of answer_objs and news_data:", len(answer_objs), len(news_data))
+
                 # global_generator_model이 리스트인 경우 첫 번째 요소 사용
                 model_name = global_generator_model
                 if isinstance(global_generator_model, list):
@@ -381,21 +679,21 @@ def process_uploaded_files(files, use_type='No Retriever with No Metadata', ques
                 elif not isinstance(global_generator_model, str):
                     model_name = str(global_generator_model)
                 
-                if question_type_str == "MCQ":
+                if question_type == "MCQ":
                     eval_results = accuracy(answer_objs, news_data) # 정확도 선다형
-                elif question_type_str == "Generate":
+                elif question_type == "Generate":
                     eval_results = gen_eval(answer_objs, news_data) # 주관식 
                 
                 # 결과를 문자열로 변환하여 저장
                 if isinstance(eval_results, dict):
                     # 딕셔너리인 경우 주요 정보만 추출
                     total_questions = eval_results.get('total', len(news_data))
-                    if question_type_str == "MCQ":
+                    if question_type == "MCQ":
                         accuracy_score = eval_results.get('accuracy', 'N/A')
                         correct_answers = eval(accuracy_score) * int(total_questions) if isinstance(accuracy_score, str) else accuracy_score * int(total_questions)
                         # correct_answers = eval_results.get('correct', 'N/A')
                         result_str = f"File: {file.name} - Accuracy: {accuracy_score}, Correct: {correct_answers}/{total_questions}"
-                    elif question_type_str == "Generate":
+                    elif question_type == "Generate":
                         em_score = eval_results.get('em', 0)
                         f1_score = eval_results.get('f1', 0)
                         result_str = f"File: {file.name} - EM: {em_score}, F1: {f1_score}, Total: {total_questions}"
@@ -406,9 +704,9 @@ def process_uploaded_files(files, use_type='No Retriever with No Metadata', ques
                 processed_list.append(result_str)
                 print(f"✅ Evaluation completed for {file.name}: {result_str}")
 
-                if question_type_str == "MCQ":
+                if question_type == "MCQ":
                     accuracy_report_file = f"results/accuracy_report_{file.name.split('/')[-1]}"
-                elif question_type_str == "Generate":
+                elif question_type == "Generate":
                     accuracy_report_file = f"results/accuracy_report_{file.name.split('/')[-1].replace('.json', '_gen.json')}"
                 accuracy_reports = make_accuracy_reports(answer_objs, news_data, file_name=accuracy_report_file)
                 print("accuracy_reports")
@@ -424,9 +722,10 @@ def process_uploaded_files(files, use_type='No Retriever with No Metadata', ques
         status_msg = f"? Processed Finished:\n {len(files)} files, {total_docs} documents processed."
         
         status_msg += f"\n{len(processed_list)} evaluations completed."
+        time_spend = time.time() - start_time # 소요시간 (초로 표현)
         if processed_list:
             joined_list = '\n'.join(processed_list)
-            status_msg += f"\nEvaluation Results:\n{joined_list}"
+            status_msg += f"\nEvaluation Results:\n{joined_list} \nTime spent: {time_spend:.2f} seconds"
 
         progress_html += f"<p style='color: green;'>{status_msg}</p>"
 
@@ -474,8 +773,8 @@ def make_accuracy_reports(pred_data, gold_data, file_name="results/metadata_extr
                 golds = [gold["choices"][int(idx)] for idx in gold["answer"]]
                 golds = [' '.join(perm) for perm in list(itertools.permutations(golds))]
                 res_obj["answer"] = [answer_choices[int(num)] for num in answer_num]
-                res_obj["em"] = exact_match_score(pred[0], golds[0])
-                res_obj["f1"] = f1_score(pred[0], golds[0])
+                res_obj["em"] = exact_match_score(pred, golds)
+                res_obj["f1"] = f1_score(pred, golds)
         accuracy_results.append(res_obj)
     
     accuracy_objs = [json.dumps(res, ensure_ascii=False) for res in accuracy_results]
@@ -613,130 +912,7 @@ def create_gradio_interface():
             except Exception as e:
                 return f"An error occurred during loading: {str(e)}"
 
-        # 검색 2개 결과 출력 (성능 개선)
-        def return_date_info(query_input):
-            import time
-            import subprocess
-            import os
-            import tempfile
-            import xml.etree.ElementTree as ET
-            from typing import List, Dict, Optional
-            start_time = time.time()
-
-            # 결과 해석
-            results_output = "Results from query:\n"
-            results_output += f"Query: {query_input}\n\n"
-
-            # heidel_time 실행
-            heidel_time_dir = "/mnt/nvme02/home/tdrag/vaiv/RTRAG/heideltime"
-            jar_path = os.path.join(heidel_time_dir, "target/de.unihd.dbs.heideltime.standalone.jar")
-            lib_path = os.path.join(heidel_time_dir, "lib/*")
-            config_path = os.path.join(heidel_time_dir, "config.props")
-
-            # Create temporary input file
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp_input:
-                tmp_input.write(query_input)
-                tmp_input_path = tmp_input.name
-            
-            try:
-                # Build command
-                cmd = [
-                    'java', '-cp', f"{jar_path}:{lib_path}",
-                    'de.unihd.dbs.heideltime.standalone.HeidelTimeStandalone',
-                    tmp_input_path,
-                    '-c', config_path,
-                    '-l', "english",
-                    '-t', "narratives",
-                    '-pos', "no"
-                ]
-
-                # execute HeidelTime
-                result = subprocess.run(
-                    cmd,
-                    cwd=heidel_time_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
-
-                if result.returncode != 0:
-                    raise RuntimeError(f"HeidelTime failed: {result.stderr}")
-                
-                # Parse the output
-                timeml_output = result.stdout # xml output
-                root = ET.fromstring(timeml_output)
-                # timexes = []
-                timexes_bases = root.findall('.//TIMEX3')
-                
-                # 결과 해석 -> 텍스트 출력
-                results_output += "### HeidelTime Results\n\n"
-                for idx, val in enumerate(timexes_bases):
-                    results_output += f"Result {idx + 1}"
-                    results_output += f" - Type: {val.get('type', 'NONE')} "
-                    results_output += f" - Value: {val.get('value', 'NONE')} "
-                    results_output += f" - Text: {val.text.strip() if val.text else ''}"
-                    results_output += "\n"
-                
-            except subprocess.TimeoutExpired:
-                results_output += "\n### HeidelTime Error\n\nHeidelTime execution timed out\n"
-            except Exception as e:
-                results_output += f"\n### HeidelTime Error\n\nError: {str(e)}\n"
-            finally:
-                # Clean up temporary file
-                try:
-                    if os.path.exists(tmp_input_path):
-                        os.unlink(tmp_input_path)
-                except Exception:
-                    pass  # 파일 삭제 실패해도 계속 진행
-
-            # local llm 실행 - (일단 GPT-4o로 활용)
-            try:
-                from openai import OpenAI
-                client = OpenAI(api_key=global_api_key)
-                query_sample = "Today is July 13, 2025. I have a meeting tomorrow at 3 PM. Last week, I visited my grandmother."
-                results_xml_output = """<?xml version="1.0"?>
-<!DOCTYPE TimeML SYSTEM "TimeML.dtd">
-<TimeML>
-<TIMEX3 tid="t5" type="DATE" value="PRESENT_REF">Today</TIMEX3> is <TIMEX3 tid="t3" type="DATE" value="2025-07-13">July 13, 2025</TIMEX3>. I have a meeting <TIMEX3 tid="t6" type="DATE" value="2025-07-14">tomorrow</TIMEX3> at <TIMEX3 tid="t7" type="TIME" value="2025-07-14T15:00">3 PM.</TIMEX3> <TIMEX3 tid="t8" type="DATE" value="2025-W28">Last week</TIMEX3>, I visited my grandmother.
-
-</TimeML>"""
-                # 쿼리 추출 
-                root = ET.fromstring(results_xml_output)
-                timexes_bases = root.findall('.//TIMEX3')
-                results_from_sample = ""
-                for idx, val in enumerate(timexes_bases):
-                    results_from_sample += f"Result {idx + 1}"
-                    results_from_sample += f" - Type: {val.get('type', 'NONE')} "
-                    results_from_sample += f" - Value: {val.get('value', 'NONE')}"
-                    results_from_sample += f" - Text: {val.text.strip() if val.text else ''}"
-                    results_from_sample += "\n"
-                
-                response = client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[
-                        {"role": "system", "content": "You are a helpful assistant."},
-                        {"role": "user", "content": f"Please deduce the results from the following query: {query_sample}"},
-                        {"role": "assistant", "content": f"Results: {results_from_sample}"},
-                        {"role": "user", "content": f"Please deduce the results from the following query: {query_input}"},
-                    ],
-                    max_tokens=1000,
-                    temperature=0.2
-                )
-
-                llm_results = response.choices[0].message.content.strip()
-                results_output += "\n### LLM Deduced Results\n\n"
-                results_output += llm_results + "\n"
-
-            except ET.ParseError as e:
-                results_output += f"\n### Error in XML Parsing\n\nError: {str(e)}\n"
-            except Exception as e:
-                results_output += f"\n### Error in LLM Processing\n\nError: {str(e)}\n"
-
-            processing_time = time.time() - start_time
-            
-            # text 결과 출력
-            return results_output
-
+        
         # 검색 버튼 클릭 이벤트 연결
         search_button.click(
             fn=return_date_info,
