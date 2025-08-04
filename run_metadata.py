@@ -104,6 +104,7 @@ def initialize_manager():
     )
 
     # 검색 모델 미리 로드
+    
     if global_retriever is None or global_retriever_model is None or global_tokenizer is None:
         print("Loading retrieval models...")
         retriever, retriever_model, tokenizer = load_model(
@@ -115,6 +116,7 @@ def initialize_manager():
         global_retriever_model = retriever_model
         global_tokenizer = tokenizer
         print("Retrieval models loaded successfully")
+    
 
     base_dir = Path("faiss_indexes_gcs")  # 임시 FAISS DB 경로 수정
     sub_dirs = [
@@ -261,7 +263,7 @@ def return_date_info(query_input, use_heidel_time=True, use_llm =True):
     return results_output
 
 # FAISS DB에 넣기
-def process_uploaded_files(files, use_type='No Retriever with No Metadata', question_type='MCQ'):
+def process_uploaded_files(files, use_type='No Retriever with No Metadata', question_type='MCQ', use_faiss=True):
     global global_manager, global_api_key
     if global_manager is None:
         global_manager = initialize_manager()
@@ -348,13 +350,16 @@ def process_uploaded_files(files, use_type='No Retriever with No Metadata', ques
                     else:
                         end_date = '20000101_nm'
                         start_date = None
+                    
                     search_result = retrieve_single_question(
                         query, global_retriever_model, global_retriever, global_tokenizer, GCS_KEY, ENGINE_KEY,
                         top_k=top_k, start_date=start_date, end_date=end_date, use_metadata=use_metadata,
                         use_reranking=True,
                         rerank_method="cohere" if COHERE_API_KEY else "custom",
-                        rerank_api_key=COHERE_API_KEY or OPENAI_API_KEY
+                        rerank_api_key=COHERE_API_KEY or OPENAI_API_KEY,
+                        chunk_size=1000, chunk_overlap=500
                     )
+
                     if not search_result:
                         print(f"No search result for query: {query}")
                         search_list.append([])
@@ -362,124 +367,92 @@ def process_uploaded_files(files, use_type='No Retriever with No Metadata', ques
                     else:
                         print(f"Search result for query '{query}': {search_result}")
                         search_list.append(search_result)
+                
+                # search_list -> FAISS DB에 저장. 중복이 있을 수 있으므로 불러오기
+                if use_metadata and use_faiss:
+                    # 날짜별로 인덱싱 및 문서 처리
+                    progress_html_new = progress_html + f"<p>Creating Indexes... ({len(search_list)})</p>"
+                    yield processed_data, progress_html_new
 
-
-
-            """
-            # 각 뉴스 db에 저장 - 불필요
-            if "Retriever" == use_type[0:9].strip():
-                # 필수 키 확인 # 다음 세 리스트의 페어 중 하나는 반드시 있어야 함
-                # 기본적으로 뉴스 데이터 -> DB에 저장
-                # 데이터 가져오기 
-                # key - 키 통일 id, query, source, date, url, answers
-                # 날짜별 그룹화
-                date_groups = {}
-                for news_idx, news in enumerate(tqdm(news_data, desc="Processing news data")):
-                    print("news keys", news.keys())
-                    part_date = analyze_qa_type(news, qa_name="realtimeqa", question_type=question_type, use_type=use_type)
-                    date = part_date.get('date', '20000000') # 기본값 설정
-                    if isinstance(date, str):
-                        date = process_date_string(date)
-                    elif isinstance(date, datetime.date):
-                        date = date.strftime("%Y%m%d")
-                    else:
-                        date = '20000000' if use_metadata else '20000000_nm' # 기본값 설정
-                    # date_group 키 이름 바꾸기
-                    if use_metadata == False:
-                        date = f"{date}_nm" # no metadata 접두어 추가
-                    if date not in date_groups:
-                        date_groups[date] = []
-                    date_groups[date].append(part_date)
-
-                    if news_idx % max(1, len(news_data)//10) == 0:
-                        progress = (news_idx + 1) / len(news_data) * 100
-                        progress_html += f"<p>Progressing documents: {progress:.1f}% ({news_idx + 1}/{len(news_data)})</p>"
-                        yield processed_data, progress_html
-
-                processed_data["Index_by_date"][file.name] = {
-                    "Number_of_documents": len(news_data),
-                    "Number_of_documents_by_date": {date: len(articles) for date, articles in date_groups.items()}
-                }
-                total_docs += len(news_data)
-
-                # make news index
-                progress_html += f"<p>Creating Indexes... ({len(date_groups)})</p>"
-                yield processed_data, progress_html
-
-                # 날짜별로 인덱싱 및 문서 처리
-                for date_idx, (date, articles) in enumerate(date_groups.items(), 1):
-                    progress_html += f"<p>Making {date} date index... ({date_idx}/{len(date_groups)})</p>"
-                    yield processed_data, progress_html
-
-                    # articles -> 획일화
-                    {
-                        'id': '20250516_0_nota', 
-                        'date': '2025/05/16', 
-                        'source': 'CNN', 
-                        'url': 'https://edition.cnn.com/interactive/2025/05/us/cnn-5-things-news-quiz-may-16-sec/', 
-                        'query': 'The Qatari royal family has offered President Donald Trump which of the following expensive gifts?', 
-                        'answer': ['1']
-                    }
-                    article_objs = [] # 각 문서에서 document 작성 -> question_sentence -> search_result
-                    for article in tqdm(articles, desc=f"Processing articles for date {date}"):
-                        print(f"[DEBUG] Articles for date {date}: {article}")  # 첫 번째 기사만 출력
-                        query = article.get('query', "")
-                        if not query:
-                            continue
-                        # find search_result from query by retrieve_single_question
-                        top_k = 5
-                        # 전역 모델 사용해서 호출
-                        global global_retriever, global_retriever_model, global_tokenizer
-                        
-                        if global_retriever is None or global_retriever_model is None or global_tokenizer is None:
-                            device = 'cuda' if torch.cuda.is_available() else 'cpu'
-                            global_retriever, global_retriever_model, global_tokenizer = load_model(
-                                BASE_RETRIEVER_MODEL, 
-                                top_k=top_k,
-                                device=device
-                            )
-                        
-                        
-                        end_date = article.get('date', '20000000')
-                        if isinstance(end_date, str):
-                            end_date = process_date_string(end_date)
-                        elif isinstance(end_date, datetime.date):
-                            end_date = end_date.strftime("%Y%m%d")
-                        else:
-                            end_date = '20000000'
-
-                        if not use_metadata:
-                            end_date = f"{end_date}_nm"
-
-                        search_result = retrieve_single_question(
-                            query, global_retriever_model, global_retriever, global_tokenizer, GCS_KEY, ENGINE_KEY, 
-                            top_k=top_k, start_date=None, end_date=end_date, use_metadata=use_metadata,
-                            use_reranking=True, 
-                            rerank_method="cohere" if COHERE_API_KEY else "custom",
-                            rerank_api_key=COHERE_API_KEY or OPENAI_API_KEY
-                        )
-
+                    # search_list -> 문서 생성
+                    documents = []
+                    for idx, (search_result, news) in enumerate(tqdm(zip(search_list, analyzed_news_data), desc="Creating documents from search results")):
                         if not search_result:
-                            print(f"No search result for query: {query}")
+                            logging.warning(f"No search results for index {idx} in {file.name}. Skipping.")
                             continue
-                        
-                        # search_result -> question_id, search_time, search_result
-                        search_time = datetime.datetime.now(datetime.timezone.utc).strftime("%Y/%m/%d")
-                        question_id = article.get('question_id', f"{date}_{uuid4().hex[:8]}")  # question_id 생성
-                        output = {"question_id": question_id, "search_time": search_time, "search_result": search_result}
-                        # 문서 생성
-                        article_objs.append(output)
-                        
+                        for result in search_result:
+                            doc = Document(
+                                page_content=result.get('text', 'No Text'),
+                                metadata={
+                                    'title': result.get('title', 'No Title'),
+                                    'doc_id': result.get('doc_id', 'No Doc ID'),
+                                    'query': query,
+                                    'date': result.get('date', '20000101'),
+                                    'source': result.get('source', 'None')
+                                }
+                            )
+                            documents.append(doc)
+                            # 문서명 호출 - faiss_indexes_gcs/{date}_{source} - example : 20250601_CNN
+                            logging.info(f"Document created for query '{query}': {doc.metadata['title']} (ID: {doc.metadata['doc_id']})")
+                            index_name = f"{result.get('date', '20000101')}_{result.get('source', 'None').replace(' ', '_')}"
+                            # 만약 faiss_indexes_gcs/{date}_{source}가 없다면 생성
+                            if not global_manager.has_index(index_name):
+                                global_manager.create_index(index_name, documents=[doc], ids=[str(uuid4())])
+                            # 아니면 그대로 호출
+                            else:
+                                logging.info(f"Index {index_name} already exists. Adding documents to it.")
+                            
+                            ids = [str(uuid4())]  # 각 문서에 고유 ID 할당
+                            global_manager.create_index(index_name, [doc], ids)
+                            print("DEBUG: Document added to index:", index_name, "with ID:", ids[0])
+                            processed_data["Current_indices"][index_name] = len(documents)
+                            total_docs += len(documents)
+                            #if idx % max(1, len(search_list)//100) == 0:
+                            #    progress_html_new += f"<p>Progressing documents: {idx + 1}/{len(search_list)}</p>"
+                            #    yield processed_data, progress_html_new
+                            print("DEBUG: Current index:", index_name, "Total documents in index:", len(documents))
 
-                    print(f"[DEBUG] Created document for date {date}: {article_objs}")  # 디버깅용 출력
-                    # 전역 manager를 사용하여 인덱스 생성
-                    global_manager.process_news_by_date({date: article_objs})
+                            progress_html_new = progress_html + f"<p>Added {len(documents)} documents to the index.</p>"
+                            yield processed_data, progress_html_new
+                            global_manager.indexes[index_name].save_local(str(global_manager.base_dir / index_name))
+                            print(f"Total documents added to index {index_name}: {len(documents)}")
 
-                processed_data["Current_indices"] = {
-                    "Base_dir": str(global_manager.base_dir),
-                    "List_of_generated_date_indexes": list(date_groups.keys())
-                }
-            """
+                # 메타데이터 없을때는 20000000_nm 인덱스에 추가
+                elif not use_metadata and use_faiss:
+                    index_name = "20000000_nm"
+                    # documents 재정의
+                    documents = []
+                    # if not global_manager.has_index(index_name):
+                    #    global_manager.create_index(index_name, documents=[], ids=[])
+                    # documents 생성 - 
+                    for idx, (search_result, news) in enumerate(tqdm(zip(search_list, analyzed_news_data), desc="Creating documents from search results")):
+                        if not search_result:
+                            logging.warning(f"No search results for index {idx} in {file.name}. Skipping.")
+                            continue
+                        for result in search_result:
+                            doc = Document(
+                                page_content=result.get('text', 'No Text'),
+                                metadata={
+                                    'title': result.get('title', 'No Title'),
+                                    'doc_id': result.get('doc_id', 'No Doc ID'),
+                                    'query': query,
+                                    'date': '20000000_nm',
+                                    'source': 'None'
+                                }
+                            )
+                            documents.append(doc)
+                            # 문서명 호출 - faiss_indexes_gcs/{date}_{source} - example : 20250601_CNN
+                            logging.info(f"Document created for query '{query}': {doc.metadata['title']} (ID: {doc.metadata['doc_id']})")
+                    ids = [str(uuid4()) for _ in range(len(documents))]  # 각 문서에 고유 ID 할당
+                    global_manager.create_index(index_name, documents, ids)
+                    processed_data["Current_indices"][index_name] = len(documents)
+                    total_docs += len(documents)
+                    progress_html_new = progress_html + f"<p>Added {len(documents)} documents to the index.</p>"
+                    yield processed_data, progress_html_new
+                    # 저장 함수 추가
+                    global_manager.indexes[index_name].save_local(str(global_manager.base_dir / index_name))
+                    print(f"Total documents added to index {index_name}: {len(documents)}")
+
             
             # 답변 처리 - 모든 경우에 해결
             # elif use_type.lower() in ['qa', 'realtimeqa', 'realtime', 'cnnqa', 'newsqa']:

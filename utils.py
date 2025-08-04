@@ -16,6 +16,8 @@ from retrieval.dpr import run_dpr_question, load_model
 from retrieval.gcs import search as gcs_search, parse_article
 from reranker import SearchReranker, rerank_with_cohere, rerank_with_custom_scoring
 
+import tldextract
+
 class DocumentV2(BaseModel):
     """Pydantic v2 호환 Document 클래스"""
     metadata: Dict[str, Any]
@@ -471,7 +473,7 @@ def classify_news_category(text, model, tokenizer):
     
     return NEWS_CATEGORY_LISTS[predicted_class] if predicted_class < len(NEWS_CATEGORY_LISTS) else "Unknown"
 
-def retrieve_single_question(question, model, retriever, tokenizer, key, engine, top_k=10, start_date=None, end_date=None, use_metadata=True, use_reranking=True, rerank_method="custom", rerank_api_key=None):
+def retrieve_single_question(question, model, retriever, tokenizer, key, engine, top_k=10, start_date=None, end_date=None, use_metadata=True, use_reranking=True, rerank_method="custom", rerank_api_key=None, chunk_size=1000, chunk_overlap=500):
     """
     단일 질문에 대해 DPR과 GCS를 사용하여 검색 결과를 반환합니다.
     
@@ -499,9 +501,10 @@ def retrieve_single_question(question, model, retriever, tokenizer, key, engine,
 
 
     search_result = run_dpr_question(new_question, retriever, model, tokenizer)
+    # search_result = [] # 일시적으로 빈 리스트로 정의. 
 
-    if not search_result:
-        return []
+    # if not search_result:
+    #    return []
 
     # debugging start_date and end date
     print("start_date:", start_date, "end_date:", end_date)
@@ -518,7 +521,7 @@ def retrieve_single_question(question, model, retriever, tokenizer, key, engine,
             publish_date = article.get("publish_date", new_end_date) # 날짜 없으면 end_date 사용
             publish_date = process_date_string(publish_date)  # 날짜 문자열을 'YYYYMMDD' 형식으로 변환
             article["text"], article["authors"], article["publish_date"] = parse_article(article["url"])
-            doc_chunks = create_chunks(article["text"], chunk_size=1000, overlap=500)
+            doc_chunks = create_chunks(article["text"], chunk_size=chunk_size, overlap=chunk_overlap)
             for chunk in doc_chunks:
                 # start_date와 end_date를 기준으로 날짜 필터링
                 if start_date and compare_earlier_date(publish_date, start_date):
@@ -532,6 +535,12 @@ def retrieve_single_question(question, model, retriever, tokenizer, key, engine,
                         chunk = chunk[:4000] + "..."
                     # 새로운 결과 추가
                     if use_metadata:
+                        source = article.get("source", "")
+                        if not source and article.get("url", ""):
+                            # URL에서 메인 도메인 추출
+                            source = find_source_from_url(article["url"])
+                        elif not source:
+                            source = ""
                         new_gcs_result_obj = {
                             "doc_id": article.get("doc_id", str(uuid4())),
                             "text": chunk,
@@ -541,6 +550,7 @@ def retrieve_single_question(question, model, retriever, tokenizer, key, engine,
                             "title": article.get("title", ""),
                             "search_time": gcs_time,
                             "authors": article.get("authors", []),
+                            "source": source,
                         }
                     else:
                         new_gcs_result_obj = {
@@ -679,9 +689,13 @@ def analyze_qa_type(part_dic, qa_name="realtimeqa", question_type="MCQ", use_typ
             else:
                 res_obj["answers"] = [part_answer] # 선택지 리스트
         elif question_type == "Generate":
-            # 단일 답변 처리 - 
-            part_answer_num = int(part_dic.get("answer", [""])[0]) # 정수 변환
-            real_answer = part_dic.get("choices", [""])[part_answer_num] # 실제 답변
+            # 단일 답변 처리 - ]
+            # answer가 숫자일 떄
+            if isinstance(part_dic.get("answer", "")[0], int) or (part_dic.get("answer", "")[0].isdigit() and part_dic.get("choices", None) is not None):
+                part_answer_num = int(part_dic.get("answer", [""])[0]) # 정수 변환
+                real_answer = part_dic.get("choices", [""])[part_answer_num] # 실제 답변
+            elif isinstance(part_dic.get("answer", "")[0], str):
+                real_answer = part_dic.get("answer", [""]) # 리스트로 출력
             if isinstance(real_answer, list):
                 res_obj["answers"] = real_answer
             else:
@@ -801,3 +815,27 @@ def process_openai_mcq(question: str, context: str, choices=[], client=None, api
 def rerank_documents(question, documents, model, tokenizer, top_k=5):
     """문서 reranking 함수 (향후 구현)"""
     pass
+
+# 뉴스 URL에서 매체 source 추출 함수
+def find_source_from_url(url):
+    """
+    뉴스 URL에서 매체 source를 추출 (국가코드 ccTLD 포함)
+    """
+    ext = tldextract.extract(url)
+    main = ext.domain  # 메인 도메인
+    suffix = ext.suffix  # .com, .co.uk 등 접미사 (참고용)
+    
+    # 매핑 변환 테이블
+    mapping = {
+        'cnn': 'CNN',
+        'cbsnews': 'CBS News',
+        'abc7ny': 'ABC7 NY',
+        'facebook': 'Facebook Post',
+        'x': 'Twitter/X',
+        'kezi': 'KEZI',
+        'marylandmatters': 'Maryland Matters',
+        'theweek': 'The Week',
+        'instagram': 'Instagram',
+    }
+    
+    return mapping.get(main, main)

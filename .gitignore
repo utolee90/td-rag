@@ -13,3 +13,5 @@ keys.py
 results/*
 data/*
 heideltime
+*.log
+faiss_indexes_gcs/*

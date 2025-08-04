@@ -24,6 +24,7 @@ class VectorStoreManager:
         self.base_dir.mkdir(exist_ok=True)
         self.loaded_indexes = {}  # 로드된 인덱스
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.indexes = {} # 인덱스 저장소 추가
         print(f"VectorStoreManager using device: {self.device}")
 
     def load_created_indexes(self) -> dict:
@@ -74,6 +75,10 @@ class VectorStoreManager:
         except Exception as e:
             logging.error(f"Error loading indexes: {e}")
             return indexes_info
+    
+    def has_index(self, index_name):
+        index_path = self.base_dir / index_name
+        return index_name in self.indexes or (index_path.exists() and any(index_path.glob("*.faiss")))
 
     def load_specific_index(self, date_or_name: str):
         """특정 날짜 또는 이름의 인덱스 로드"""
@@ -125,6 +130,7 @@ class VectorStoreManager:
             vector_store.add_documents(documents=documents, ids=ids)
             vector_store.save_local(str(index_dir))
             logging.info(f"Created index for date {date} with {len(documents)} documents")
+            self.indexes[date] = vector_store # index storage
         except Exception as e:
             logging.error(f"Error creating index for date {date}: {e}")
             raise
