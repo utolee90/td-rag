@@ -500,8 +500,8 @@ def retrieve_single_question(question, model, retriever, tokenizer, key, engine,
         new_question = question
 
 
-    search_result = run_dpr_question(new_question, retriever, model, tokenizer)
-    # search_result = [] # 일시적으로 빈 리스트로 정의. 
+    # search_result = run_dpr_question(new_question, retriever, model, tokenizer)
+    search_result = [] # 일시적으로 빈 리스트로 정의. 
 
     # if not search_result:
     #    return []
